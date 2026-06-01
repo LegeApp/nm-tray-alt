@@ -592,6 +592,74 @@ QString NmModel::primaryConnectionPath() const
     return mManagerState.primaryConnectionPath;
 }
 
+QString NmModel::primaryPhysicalConnectionPath() const
+{
+    auto isPhysical = [](const nm::ActiveConnectionRecord &active) {
+        return !active.isVpn && !nm::isVpnType(active.type) && !active.devices.isEmpty();
+    };
+
+    const auto primaryIt = std::find_if(mActive.cbegin(), mActive.cend(), [this](const nm::ActiveConnectionRecord &active) {
+        return active.path == mManagerState.primaryConnectionPath;
+    });
+    if (primaryIt != mActive.cend() && isPhysical(*primaryIt)) {
+        return primaryIt->path;
+    }
+
+    const auto defaultIt = std::find_if(mActive.cbegin(), mActive.cend(), [isPhysical](const nm::ActiveConnectionRecord &active) {
+        return isPhysical(active) && (active.isDefault4 || active.isDefault6);
+    });
+    if (defaultIt != mActive.cend()) {
+        return defaultIt->path;
+    }
+
+    const auto firstPhysicalIt = std::find_if(mActive.cbegin(), mActive.cend(), isPhysical);
+    return firstPhysicalIt == mActive.cend() ? QString{} : firstPhysicalIt->path;
+}
+
+QString NmModel::primaryPhysicalInterfaceName() const
+{
+    auto interfaceForActive = [this](const nm::ActiveConnectionRecord &active) -> QString {
+        if (active.isVpn || nm::isVpnType(active.type)) {
+            return {};
+        }
+        for (const QString &devicePath : active.devices) {
+            const auto devIt = mCache.snapshot().devices.find(devicePath);
+            if (devIt != mCache.snapshot().devices.end() && !devIt->interfaceName.isEmpty()) {
+                return devIt->interfaceName;
+            }
+        }
+        return {};
+    };
+
+    const auto primaryIt = std::find_if(mActive.cbegin(), mActive.cend(), [this](const nm::ActiveConnectionRecord &active) {
+        return active.path == mManagerState.primaryConnectionPath;
+    });
+    if (primaryIt != mActive.cend()) {
+        const QString iface = interfaceForActive(*primaryIt);
+        if (!iface.isEmpty()) {
+            return iface;
+        }
+    }
+
+    const auto defaultIt = std::find_if(mActive.cbegin(), mActive.cend(), [](const nm::ActiveConnectionRecord &active) {
+        return !active.isVpn && !nm::isVpnType(active.type) && (active.isDefault4 || active.isDefault6);
+    });
+    if (defaultIt != mActive.cend()) {
+        const QString iface = interfaceForActive(*defaultIt);
+        if (!iface.isEmpty()) {
+            return iface;
+        }
+    }
+
+    for (const auto &active : mActive) {
+        const QString iface = interfaceForActive(active);
+        if (!iface.isEmpty()) {
+            return iface;
+        }
+    }
+    return {};
+}
+
 bool NmModel::showLowSignalNetworks() const
 {
     return mShowLowSignalNetworks;

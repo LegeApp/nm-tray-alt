@@ -50,6 +50,7 @@ set(SRCS
     src/tray.cpp
     src/translate.cpp
     src/wifi_password_dialog.cpp
+    src/autotz.cpp
     src/main.cpp
 )
 
@@ -82,6 +83,7 @@ set_property(TARGET nm-tray PROPERTY CXX_STANDARD_REQUIRED on)
 target_link_libraries(nm-tray
     Qt6::Widgets
     Qt6::Gui
+    Qt6::Network
     Qt6::DBus
 )
 

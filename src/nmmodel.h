@@ -115,6 +115,8 @@ public:
     bool wirelessEnabled() const;
     bool wirelessHardwareEnabled() const;
     QString primaryConnectionPath() const;
+    QString primaryPhysicalConnectionPath() const;
+    QString primaryPhysicalInterfaceName() const;
     bool showLowSignalNetworks() const;
     QList<RecentConnection> recentConnections(int maxCount = 3) const;
 

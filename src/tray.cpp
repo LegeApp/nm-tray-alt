@@ -29,6 +29,7 @@ COPYRIGHT_HEADER*/
 
 #include "icons.h"
 #include "nmmodel.h"
+#include "autotz.h"
 #include "nmproxy.h"
 #include "log.h"
 #include "dbus/org.freedesktop.Notifications.h"
@@ -74,7 +75,7 @@ public:
     QScopedPointer<QDialog> mInfoDialog;
 
     org::freedesktop::Notifications mNotification;
-
+    QScopedPointer<AutoTz> mAutoTz;
 
     // configuration
     bool mEnableNotifications; //!< should info about connection establishment etc. be sent by org.freedesktop.Notifications
@@ -292,6 +293,8 @@ Tray::Tray(QObject *parent/* = nullptr*/)
         d->openCloseDialog(d->mConnDialog.data());
     });
     connect(d->mRequestScan, &QAction::triggered, &d->mNmModel, &NmModel::requestAllWifiScan);
+
+    d->mAutoTz.reset(new AutoTz(&d->mNmModel));
 
     d->primaryConnectionUpdate();
     setActionsStates();
