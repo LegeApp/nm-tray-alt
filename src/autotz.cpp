@@ -20,7 +20,12 @@ struct Service {
     std::initializer_list<const char *> keys;
 };
 
+// ipinfo.io is tried first: ISPs that backhaul island regions (e.g. Bali) through
+// IP space registered to a mainland city cause MaxMind-derived databases
+// (chrisdown/ipapi/ipwho.is) to all agree on the wrong mainland timezone.
+// ipinfo.io's database has so far been the one to get those cases right.
 static constexpr Service kServices[] = {
+    {"https://ipinfo.io/json", {"timezone"}},
     {"https://geoip.chrisdown.name/", {"location", "time_zone"}},
     {"https://ipapi.co/json/", {"timezone"}},
     {"https://worldtimeapi.org/api/ip", {"timezone"}},
