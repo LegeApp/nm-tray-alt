@@ -14,7 +14,7 @@
    <string>Connection information</string>
   </property>
   <layout class="QGridLayout" name="gridLayout">
-   <item row="0" column="0">
+   <item row="1" column="0">
     <widget class="QTabWidget" name="tabWidget">
      <property name="currentIndex">
       <number>-1</number>
@@ -27,7 +27,7 @@
      </property>
     </widget>
    </item>
-   <item row="1" column="0">
+   <item row="2" column="0">
     <widget class="QCheckBox" name="autoConnectCheckBox">
      <property name="text">
       <string>Connect to this network automatically</string>

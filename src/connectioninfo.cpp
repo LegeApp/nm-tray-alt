@@ -23,12 +23,45 @@ COPYRIGHT_HEADER*/
 #include "connectioninfo.h"
 #include "ui_connectioninfo.h"
 #include "nmproxy.h"
+#include "backend/connectivity_monitor.h"
+#include "troubleshootdialog.h"
+
+#include <QDBusConnection>
+#include <QDBusMessage>
+#include <QDBusPendingCall>
+#include <QDBusVariant>
+#include <QDesktopServices>
 #include <QScrollArea>
 #include <QLabel>
 #include <QItemSelection>
 #include <QSortFilterProxyModel>
 #include <QTabBar>
 #include <QCheckBox>
+#include <QGridLayout>
+#include <QHBoxLayout>
+#include <QIcon>
+#include <QPushButton>
+#include <QSet>
+#include <QUrl>
+
+namespace
+{
+void setStatsRate(const QString &devicePath, uint ms)
+{
+    if (devicePath.isEmpty() || devicePath == QStringLiteral("/")) {
+        return;
+    }
+    QDBusMessage msg = QDBusMessage::createMethodCall(
+        QStringLiteral("org.freedesktop.NetworkManager"),
+        devicePath,
+        QStringLiteral("org.freedesktop.DBus.Properties"),
+        QStringLiteral("Set"));
+    msg << QStringLiteral("org.freedesktop.NetworkManager.Device.Statistics")
+        << QStringLiteral("RefreshRateMs")
+        << QVariant::fromValue(QDBusVariant(ms));
+    QDBusConnection::systemBus().asyncCall(msg, 3000);
+}
+}
 
 ConnectionInfo::ConnectionInfo(NmModel * model, QWidget *parent)
     : QDialog{parent}
@@ -36,10 +69,59 @@ ConnectionInfo::ConnectionInfo(NmModel * model, QWidget *parent)
     , mModel{model}
     , mActive{new NmProxy}
     , mSorted{new QSortFilterProxyModel}
+    , mConnectivity{new nm::ConnectivityMonitor}
 
 {
-    setAttribute(Qt::WA_DeleteOnClose);
     ui->setupUi(this);
+
+    auto *bannerIcon = new QLabel(this);
+    auto *banner = new QLabel(this);
+    banner->setTextFormat(Qt::PlainText);
+    banner->setWordWrap(true);
+    auto *portalBtn = new QPushButton(tr("Open sign-in page"), this);
+    auto *checkBtn = new QPushButton(tr("Check now"), this);
+    auto *troubleshootBtn = new QPushButton(tr("Troubleshoot…"), this);
+    portalBtn->hide();
+
+    auto *row = new QHBoxLayout;
+    row->addWidget(bannerIcon);
+    row->addWidget(banner, 1);
+    row->addWidget(portalBtn);
+    row->addWidget(checkBtn);
+    row->addWidget(troubleshootBtn);
+    if (auto *grid = qobject_cast<QGridLayout *>(layout())) {
+        grid->addLayout(row, 0, 0);
+    }
+
+auto renderConnectivity = [this, bannerIcon, banner, portalBtn] {
+        const char *icon = "dialog-question";
+        switch (mConnectivity->status()) {
+        case nm::InternetStatus::Full: icon = "network-transmit-receive"; break;
+        case nm::InternetStatus::Portal: icon = "dialog-warning"; break;
+        case nm::InternetStatus::NoInternet: icon = "network-error"; break;
+        case nm::InternetStatus::NoNetwork: icon = "network-offline"; break;
+        case nm::InternetStatus::Checking: icon = "view-refresh"; break;
+        case nm::InternetStatus::Unknown: break;
+        }
+        bannerIcon->setPixmap(QIcon::fromTheme(QLatin1String(icon)).pixmap(22, 22));
+        banner->setText(mConnectivity->statusText());
+        portalBtn->setVisible(mConnectivity->status() == nm::InternetStatus::Portal);
+    };
+    connect(mConnectivity.data(), &nm::ConnectivityMonitor::statusChanged, this, renderConnectivity);
+    connect(checkBtn, &QPushButton::clicked, mConnectivity.data(), &nm::ConnectivityMonitor::recheckNow);
+    connect(portalBtn, &QPushButton::clicked, this, [this] {
+        QDesktopServices::openUrl(mConnectivity->portalProbeUrl());
+    });
+    connect(troubleshootBtn, &QPushButton::clicked, this, [this] {
+        auto *dlg = new TroubleshootDialog(mModel, nullptr);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+        dlg->raise();
+        dlg->activateWindow();
+    });
+    connect(mModel, &NmModel::managerStateChanged, this, &ConnectionInfo::feedConnectivity);
+    feedConnectivity();
+    renderConnectivity();
 
     mActive->setNmModel(mModel, NmModel::ActiveConnectionType);
     mSorted->setSortCaseSensitivity(Qt::CaseInsensitive);
@@ -87,10 +169,12 @@ ConnectionInfo::ConnectionInfo(NmModel * model, QWidget *parent)
         mModel->setConnectionAutoconnect(connectionPath, checked);
     });
     syncAutoConnectUi();
+    enableStatsForVisibleDevices(2000);
 }
 
 ConnectionInfo::~ConnectionInfo()
 {
+    enableStatsForVisibleDevices(0);
 }
 
 void ConnectionInfo::addTab(QModelIndex const & index)
@@ -145,5 +229,28 @@ void ConnectionInfo::syncAutoConnectUi()
         ui->autoConnectCheckBox->setText(tr("Connect to this network automatically"));
     } else {
         ui->autoConnectCheckBox->setText(tr("Automatic connection is only available for saved Wi-Fi networks"));
+    }
+}
+
+void ConnectionInfo::feedConnectivity()
+{
+    const auto s = mModel->managerState();
+    mConnectivity->updateFromSnapshot(s.rawNmState,
+                                      s.rawConnectivity,
+                                      s.connectivityCheckEnabled,
+                                      QUrl(s.connectivityCheckUri));
+}
+
+void ConnectionInfo::enableStatsForVisibleDevices(uint ms)
+{
+    QSet<QString> devices;
+    const auto &snapshot = mModel->cacheSnapshot();
+    for (const auto &active : snapshot.activeConnections) {
+        for (const QString &device : active.devices) {
+            devices.insert(device);
+        }
+    }
+    for (const QString &device : devices) {
+        setStatsRate(device, ms);
     }
 }

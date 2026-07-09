@@ -19,6 +19,7 @@ public:
 
     QString password() const;
     bool connectAnyway() const;
+    void setInfoText(const QString &text);
 
 private:
     void onPasswordChanged();
@@ -30,6 +31,8 @@ private:
     
     QLabel *mTitleLabel;
     QLabel *mSsidLabel;
+    QLabel *mInfoLabel;
+    QLabel *mValidationLabel;
     QLineEdit *mPasswordEdit;
     QPushButton *mConnectAnywayButton;
     QDialogButtonBox *mButtonBox;

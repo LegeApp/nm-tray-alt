@@ -7,11 +7,19 @@
 namespace
 {
 constexpr qint64 kStaleSeconds = 30LL * 24LL * 60LL * 60LL;
-const QString kHiddenSsid = QStringLiteral("<hidden>");
 
 bool hasConcreteSsid(const QString &ssid)
 {
-    return !ssid.isEmpty() && ssid != kHiddenSsid;
+    // An empty SSID is the in-band sentinel for a hidden network (see decodeSsid()).
+    return !ssid.isEmpty();
+}
+
+// Quantize signal strength into coarse buckets so that the small second-to-second
+// jitter every AP shows during scanning never reorders the Wi-Fi list under the
+// user's cursor. A row only changes position on a genuinely meaningful change.
+int strengthBucket(int strength)
+{
+    return strength / 20; // 0..5
 }
 
 QString wifiGroupingKey(const nm::AccessPointRecord &ap)
@@ -23,13 +31,6 @@ QString wifiGroupingKey(const nm::AccessPointRecord &ap)
         return ap.devicePath + QLatin1Char('\x1f') + ap.bssid.toLower();
     }
     return ap.devicePath + QLatin1Char('\x1f') + ap.path;
-}
-
-bool isUserFacingConnectionType(const QString &type)
-{
-    return type == QStringLiteral("802-11-wireless")
-        || type == QStringLiteral("802-3-ethernet")
-        || type == QStringLiteral("bluetooth");
 }
 
 } // namespace
@@ -82,6 +83,7 @@ QList<WifiViewRecord> NmCache::wifiEntries(bool hideStale) const
         if (!hasConcreteSsid(item.ssid)) {
             continue;
         }
+        item.ssidBytes = ap.ssidBytes;
         item.devicePath = ap.devicePath;
         item.strength = ap.strength;
         item.secure = ap.privacy || ap.wpaFlags != 0 || ap.rsnFlags != 0;
@@ -166,19 +168,23 @@ QList<WifiViewRecord> NmCache::wifiEntries(bool hideStale) const
         if (a.active != b.active) {
             return a.active;
         }
-        if (a.strength != b.strength) {
-            return a.strength > b.strength;
-        }
+        // Saved networks are pinned above unknown ones so the list the user cares
+        // about stays put; only then do we sort by (bucketed) signal strength.
         if ((a.savedConnectionPath.isEmpty()) != (b.savedConnectionPath.isEmpty())) {
             return !a.savedConnectionPath.isEmpty();
+        }
+        if (strengthBucket(a.strength) != strengthBucket(b.strength)) {
+            return strengthBucket(a.strength) > strengthBucket(b.strength);
         }
         if (a.autoconnectPriority != b.autoconnectPriority) {
             return a.autoconnectPriority > b.autoconnectPriority;
         }
-        if (a.lastUsedTimestamp != b.lastUsedTimestamp) {
-            return a.lastUsedTimestamp > b.lastUsedTimestamp;
+        // Stable tail: name, then AP path — never flips between refreshes.
+        const int byName = QString::compare(a.ssid, b.ssid, Qt::CaseInsensitive);
+        if (byName != 0) {
+            return byName < 0;
         }
-        return QString::compare(a.ssid, b.ssid, Qt::CaseInsensitive) < 0;
+        return a.apPath < b.apPath;
     });
     return out;
 }
@@ -190,8 +196,19 @@ QList<ConnectionViewRecord> NmCache::knownConnections(bool hideStale) const
         if (!isUserFacingConnectionType(conn.type)) {
             continue;
         }
-        if (conn.id == kHiddenSsid) {
-            continue;
+        if (nm::isWirelessType(conn.type)) {
+            bool visibleWifi = false;
+            for (const auto &ap : mSnapshot.accessPoints) {
+                if ((!conn.wifiSsidBytes.isEmpty() && conn.wifiSsidBytes == ap.ssidBytes)
+                    || (hasConcreteSsid(conn.wifiSsid) && conn.wifiSsid == ap.ssid)
+                    || (!conn.id.isEmpty() && conn.id == ap.ssid)) {
+                    visibleWifi = true;
+                    break;
+                }
+            }
+            if (visibleWifi) {
+                continue;
+            }
         }
         ConnectionViewRecord item;
         item.connectionPath = conn.path;
@@ -267,6 +284,11 @@ QString NmCache::connectionPathForSsid(const QString &ssid) const
 {
     const SavedConnectionRecord *best = nullptr;
     for (const auto &conn : mSnapshot.savedConnections) {
+        // Only ever match Wi-Fi profiles here — an ethernet/VPN profile that happens
+        // to share the name must never be activated on a Wi-Fi device (bug 4.7).
+        if (!nm::isWirelessType(conn.type)) {
+            continue;
+        }
         if ((hasConcreteSsid(conn.wifiSsid) && conn.wifiSsid == ssid) || conn.id == ssid) {
             if (best == nullptr
                 || conn.autoconnectPriority > best->autoconnectPriority

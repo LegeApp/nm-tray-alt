@@ -43,6 +43,11 @@ public:
         bool wirelessEnabled = false;
         bool wirelessHardwareEnabled = false;
         QString primaryConnectionPath;
+        uint rawNmState = 0;
+        uint rawConnectivity = 0;
+        bool connectivityCheckAvailable = false;
+        bool connectivityCheckEnabled = false;
+        QString connectivityCheckUri;
     };
 
     struct RecentConnection
@@ -115,11 +120,16 @@ public:
     bool wirelessEnabled() const;
     bool wirelessHardwareEnabled() const;
     QString primaryConnectionPath() const;
+    QString primaryPhysicalConnectionPath() const;
+    QString primaryPhysicalInterfaceName() const;
     bool showLowSignalNetworks() const;
+    const nm::Snapshot &cacheSnapshot() const;
+    QList<nm::ActiveConnectionRecord> activeConnections() const;
     QList<RecentConnection> recentConnections(int maxCount = 3) const;
 
 Q_SIGNALS:
     void managerStateChanged();
+    void actionFailed(const QString &summary, const QString &detail);
 
 public Q_SLOTS:
     void activateConnection(const QModelIndex &index);
@@ -130,10 +140,14 @@ public Q_SLOTS:
     void setWirelessEnabled(bool enabled);
     void setConnectionAutoconnect(const QString &connectionPath, bool enabled);
     void setShowLowSignalNetworks(bool enabled);
+    void setOrderHold(bool held);
     void disconnectPrimaryConnection();
+    void disconnectPrimaryConnectionAndStayOff();
     void activateConnectionPath(const QString &connectionPath);
+    void activateSavedOnAp(const QString &connectionPath, const QString &devicePath, const QString &apPath);
     void onSnapshotChanged(const nm::Snapshot &snapshot);
     void promptAndCreateWifiConnection(const QString &ssid, const QString &devicePath, bool secure);
+    void promptAndCreateHiddenWifiConnection();
 
 private:
     enum ItemId
@@ -152,7 +166,18 @@ private:
     bool isValidDataIndex(const QModelIndex &index) const;
     void rebuildFromSnapshot(const nm::Snapshot &snapshot);
     QString buildActiveInfo(const nm::ActiveConnectionRecord &active) const;
-    bool disconnectActiveConnection(const nm::ActiveConnectionRecord &active);
+    void disconnectActiveConnection(const nm::ActiveConnectionRecord &active, bool stayOff = false);
+    void connectToWifi(const nm::WifiViewRecord &wifi);
+    void startActivationWatch(const QString &activeConnectionPath,
+                              const nm::WifiViewRecord &wifi,
+                              const QString &settingsPath,
+                              const QString &devicePath,
+                              const QString &apPath,
+                              bool savedActivation);
+    void promptForUpdatedWifiPassword(const nm::WifiViewRecord &wifi,
+                                      const QString &settingsPath,
+                                      const QString &devicePath,
+                                      const QString &apPath);
 
 private:
     QThread mDbusThread;
@@ -165,6 +190,7 @@ private:
     QList<nm::WifiViewRecord> mWifi;
     ManagerState mManagerState;
     bool mShowLowSignalNetworks = false;
+    bool mOrderHeld = false;
 };
 
 #endif // NMMODEL_H

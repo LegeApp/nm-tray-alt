@@ -32,6 +32,7 @@ class ConnectionInfo;
 class NmModel;
 class NmProxy;
 class QSortFilterProxyModel;
+namespace nm { class ConnectivityMonitor; }
 
 class ConnectionInfo : public QDialog
 {
@@ -46,12 +47,15 @@ private:
     void removeTab(QModelIndex const & index);
     void changeTab(QModelIndex const & index);
     void syncAutoConnectUi();
+    void feedConnectivity();
+    void enableStatsForVisibleDevices(uint ms);
 
 private:
     QScopedPointer<Ui::ConnectionInfo> ui;
     NmModel * mModel;
     QScopedPointer<NmProxy> mActive;
     QScopedPointer<QSortFilterProxyModel> mSorted;
+    QScopedPointer<nm::ConnectivityMonitor> mConnectivity;
 };
 
 #endif // CONNECTIONINFO_H

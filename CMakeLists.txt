@@ -38,18 +38,23 @@ set(SRCS
     src/log.cpp
     src/icons.cpp
     src/backend/nm_types.cpp
+    src/backend/connectivity_monitor.cpp
+    src/backend/wifi_activation_watcher.cpp
+    src/backend/tray_secret_agent.cpp
     src/backend/nm_dbus_client.cpp
     src/backend/nm_actions.cpp
     src/backend/nm_cache.cpp
     src/nmmodel.cpp
     src/nmproxy.cpp
     src/connectioninfo.cpp
+    src/troubleshootdialog.cpp
     src/nmlist.cpp
     src/menuview.cpp
     src/windowmenu.cpp
     src/tray.cpp
     src/translate.cpp
     src/wifi_password_dialog.cpp
+    src/autotz.cpp
     src/main.cpp
 )
 
@@ -82,6 +87,7 @@ set_property(TARGET nm-tray PROPERTY CXX_STANDARD_REQUIRED on)
 target_link_libraries(nm-tray
     Qt6::Widgets
     Qt6::Gui
+    Qt6::Network
     Qt6::DBus
 )
 

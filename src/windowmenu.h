@@ -28,13 +28,17 @@ COPYRIGHT_HEADER*/
 
 class WindowMenuPrivate;
 class NmModel;
+namespace nm { class ConnectivityMonitor; }
 
 class WindowMenu : public QMenu
 {
     Q_OBJECT
 public:
-    WindowMenu(NmModel * nmModel, QWidget * parent = nullptr);
+    WindowMenu(NmModel * nmModel, nm::ConnectivityMonitor *connectivity = nullptr, QWidget * parent = nullptr);
     ~WindowMenu();
+
+Q_SIGNALS:
+    void requestConnectionInfo();
 
 private:
     QScopedPointer<WindowMenuPrivate> d_ptr;
@@ -43,4 +47,3 @@ private:
 
 
 #endif //WINDOW_MENU_H
-

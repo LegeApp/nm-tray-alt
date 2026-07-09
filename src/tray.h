@@ -50,6 +50,7 @@ private Q_SLOTS:
     //NetworkManager
     void setActionsStates();
     void onPrimaryConnectionChanged();
+    void showConnectionInfo();
 
 private:
     QScopedPointer<TrayPrivate> d;
