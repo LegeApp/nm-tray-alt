@@ -25,10 +25,13 @@ COPYRIGHT_HEADER*/
 #include "nmmodel.h"
 #include "nmproxy.h"
 #include "menuview.h"
-#include "connectioninfo.h"
+#include "backend/connectivity_monitor.h"
 
 #include <QWidgetAction>
 #include <QPushButton>
+#include <QLabel>
+#include <QAbstractItemModel>
+#include <QAbstractProxyModel>
 #include <functional>
 #include <QTimer>
 
@@ -36,6 +39,7 @@ class WindowMenuPrivate
 {
 public:
     NmModel * mNmModel;
+    nm::ConnectivityMonitor *mConnectivity = nullptr;
 
     QScopedPointer<NmProxy> mWirelessModel;
     QWidgetAction * mWirelessAction;
@@ -92,10 +96,7 @@ void WindowMenuPrivate::forceSizeRefresh()
     q->addAction(mMakeDirtyAction);
     q->removeAction(mMakeDirtyAction);
     // ensure to be visible (should the resize make it out of screen)
-    if (old_size != q->size())
-    {
-        q->popup(q->geometry().topLeft());
-    }
+    Q_UNUSED(old_size);
 }
 
 void WindowMenuPrivate::onViewRowChange(QAction * viewAction, QAbstractItemModel const * model)
@@ -107,45 +108,66 @@ void WindowMenuPrivate::onViewRowChange(QAction * viewAction, QAbstractItemModel
 
 
 
-WindowMenu::WindowMenu(NmModel * nmModel, QWidget * parent /*= nullptr*/)
+WindowMenu::WindowMenu(NmModel * nmModel, nm::ConnectivityMonitor *connectivity, QWidget * parent /*= nullptr*/)
     : QMenu{parent}
     , d_ptr{new WindowMenuPrivate{this}}
 {
     Q_D(WindowMenu);
     d->mNmModel = nmModel;
+    d->mConnectivity = connectivity;
+    d->mNmModel->setOrderHold(true);
+    connect(this, &QMenu::aboutToHide, this, [d] {
+        d->mNmModel->setOrderHold(false);
+    });
     d->mNmModel->requestAllWifiScan();
 
-    const NmModel::ManagerState state = d->mNmModel->managerState();
-    QString statusText = tr("No active connection");
-    bool hasPrimaryConnection = false;
-    if (!state.primaryName.isEmpty()) {
-        hasPrimaryConnection = true;
-        statusText = tr("Connected: %1").arg(state.primaryName);
-        if (state.wifiStrength >= 0) {
-            statusText += tr(" (%1%)").arg(state.wifiStrength);
-        }
-    }
-    auto *statusButton = new QPushButton(statusText);
+    auto *statusButton = new QPushButton();
     statusButton->setFlat(true);
     statusButton->setCursor(Qt::PointingHandCursor);
-    statusButton->setEnabled(hasPrimaryConnection);
-    statusButton->setToolTip(hasPrimaryConnection
-            ? tr("Disconnect current connection")
-            : tr("No active connection to disconnect"));
+    auto refreshStatus = [this, d, statusButton] {
+        const NmModel::ManagerState state = d->mNmModel->managerState();
+        bool hasPrimaryConnection = false;
+        QString statusText = tr("No active connection");
+        if (!state.primaryName.isEmpty()) {
+            hasPrimaryConnection = true;
+            statusText = tr("Connected: %1").arg(state.primaryName);
+            if (state.wifiStrength >= 0) {
+                statusText += tr(" (%1%)").arg(state.wifiStrength);
+            }
+        }
+        statusButton->setText(statusText);
+        statusButton->setEnabled(hasPrimaryConnection);
+        statusButton->setToolTip(hasPrimaryConnection
+                ? tr("Open connection information")
+                : tr("No active connection"));
+    };
+    refreshStatus();
+    connect(d->mNmModel, &NmModel::managerStateChanged, statusButton, refreshStatus);
     auto *statusAction = new QWidgetAction(this);
     statusAction->setDefaultWidget(statusButton);
     addAction(statusAction);
     connect(statusButton, &QPushButton::clicked, this, [this, d] {
-        d->mNmModel->disconnectPrimaryConnection();
+        Q_UNUSED(d);
+        emit requestConnectionInfo();
     });
-    QAction *usageAction = addAction(tr("Connection details / usage..."));
-    connect(usageAction, &QAction::triggered, [this, d] {
-        auto *dialog = new ConnectionInfo{d->mNmModel, nullptr};
-        dialog->setAttribute(Qt::WA_DeleteOnClose);
-        dialog->show();
-        dialog->raise();
-        dialog->activateWindow();
-    });
+    auto *internetLabel = new QLabel(this);
+    internetLabel->setMargin(4);
+    auto refreshInternet = [d, internetLabel] {
+        internetLabel->setText(d->mConnectivity ? d->mConnectivity->statusText() : WindowMenu::tr("Internet access unknown"));
+    };
+    refreshInternet();
+    if (d->mConnectivity != nullptr) {
+        connect(d->mConnectivity, &nm::ConnectivityMonitor::statusChanged, internetLabel, [refreshInternet] { refreshInternet(); });
+    }
+    auto *internetAction = new QWidgetAction(this);
+    internetAction->setDefaultWidget(internetLabel);
+    addAction(internetAction);
+    QAction *disconnectAction = addAction(tr("Disconnect"));
+    disconnectAction->setToolTip(tr("Disconnect this connection and allow NetworkManager to choose another one"));
+    connect(disconnectAction, &QAction::triggered, d->mNmModel, &NmModel::disconnectPrimaryConnection);
+    QAction *stayOffAction = addAction(tr("Disconnect and stay offline"));
+    stayOffAction->setToolTip(tr("Disconnect this device and prevent automatic reconnect until you choose a network"));
+    connect(stayOffAction, &QAction::triggered, d->mNmModel, &NmModel::disconnectPrimaryConnectionAndStayOff);
     addSeparator();
 
     //wireless proxy & widgets
@@ -163,7 +185,7 @@ WindowMenu::WindowMenu(NmModel * nmModel, QWidget * parent /*= nullptr*/)
     connect(d->mWirelessModel.data(), &QAbstractItemModel::rowsInserted, [d] { d->onViewRowChange(d->mWirelessAction, d->mWirelessModel.data()); });
     connect(d->mWirelessModel.data(), &QAbstractItemModel::rowsRemoved, [d] { d->onViewRowChange(d->mWirelessAction, d->mWirelessModel.data()); });
 
-    //connection proxy & widgets
+    //connection proxy & widgets: used only for "Other saved networks"
     d->mConnectionModel.reset(new NmProxy);
     d->mConnectionModel->setNmModel(d->mNmModel, NmModel::ConnectionType);
     MenuView * connection_view = new MenuView{d->mConnectionModel.data()};
@@ -178,24 +200,13 @@ WindowMenu::WindowMenu(NmModel * nmModel, QWidget * parent /*= nullptr*/)
     connect(d->mConnectionModel.data(), &QAbstractItemModel::rowsInserted, [d] { d->onViewRowChange(d->mConnectionAction, d->mConnectionModel.data()); });
     connect(d->mConnectionModel.data(), &QAbstractItemModel::rowsRemoved, [d] { d->onViewRowChange(d->mConnectionAction, d->mConnectionModel.data()); });
 
-    addAction(tr("Recent connection(s)"))->setEnabled(false);
-    const auto recents = d->mNmModel->recentConnections(3);
-    if (recents.isEmpty()) {
-        QAction *none = addAction(tr("No recent connections"));
-        none->setEnabled(false);
-    } else {
-        for (const auto &recent : recents) {
-            QAction *a = addAction(recent.id);
-            a->setToolTip(tr("Reconnect"));
-            connect(a, &QAction::triggered, this, [this, d, path = recent.connectionPath] {
-                d->mNmModel->activateConnectionPath(path);
-            });
-        }
-    }
     addAction(tr("Wi-Fi network(s)"))->setEnabled(false);
     addAction(d->mWirelessAction);
-    addAction(tr("Known connection(s)"))->setEnabled(false);
+    QAction *otherSaved = addAction(tr("Other saved networks"));
+    otherSaved->setEnabled(false);
     addAction(d->mConnectionAction);
+    QAction *hiddenAction = addAction(tr("Connect to hidden network…"));
+    connect(hiddenAction, &QAction::triggered, d->mNmModel, &NmModel::promptAndCreateHiddenWifiConnection);
     addSeparator();
     auto *toggleButton = new QPushButton(d->mNmModel->showLowSignalNetworks()
             ? tr("Hide low signal networks")

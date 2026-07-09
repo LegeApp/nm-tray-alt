@@ -95,6 +95,17 @@ AutoTz::AutoTz(NmModel *model, QObject *parent)
     QTimer::singleShot(0, this, &AutoTz::maybeStartLookup);
 }
 
+void AutoTz::setEnabled(bool enabled)
+{
+    if (mEnabled == enabled) {
+        return;
+    }
+    mEnabled = enabled;
+    if (mEnabled) {
+        maybeStartLookup();
+    }
+}
+
 void AutoTz::onManagerStateChanged()
 {
     maybeStartLookup();
@@ -102,9 +113,12 @@ void AutoTz::onManagerStateChanged()
 
 void AutoTz::maybeStartLookup()
 {
+    if (!mEnabled) {
+        return;
+    }
     const auto state = mModel->managerState();
     const bool isConnected = state.overallState == NmModel::OverallState::Connected
-        || state.overallState == NmModel::OverallState::Limited;
+        && state.rawConnectivity == 4;
     if (!isConnected || state.primaryConnectionPath.isEmpty() || state.primaryConnectionPath == QStringLiteral("/")) {
         return;
     }

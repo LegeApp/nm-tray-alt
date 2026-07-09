@@ -41,6 +41,8 @@ struct AccessPointRecord
     uint32_t rsnFlags = 0;
     uint32_t frequency = 0;
     bool privacy = false;
+
+    bool operator==(const AccessPointRecord &) const = default;
 };
 
 struct DeviceRecord
@@ -55,8 +57,12 @@ struct DeviceRecord
     QList<QString> accessPointPaths;
     QString hardwareAddress;
     int bitrateKbps = -1;
+    uint32_t ip4Connectivity = 0;
+    uint32_t ip6Connectivity = 0;
     qulonglong rxBytes = 0;
     qulonglong txBytes = 0;
+
+    bool operator==(const DeviceRecord &) const = default;
 };
 
 struct SavedConnectionRecord
@@ -71,6 +77,8 @@ struct SavedConnectionRecord
     qint64 timestamp = 0;
     int autoconnectPriority = 0;
     bool autoconnect = true;
+
+    bool operator==(const SavedConnectionRecord &) const = default;
 };
 
 struct ActiveConnectionRecord
@@ -96,6 +104,8 @@ struct ActiveConnectionRecord
     QStringList ip6Dns;
     int ip4RouteCount = 0;
     int ip6RouteCount = 0;
+
+    bool operator==(const ActiveConnectionRecord &) const = default;
 };
 
 struct ManagerState
@@ -106,7 +116,12 @@ struct ManagerState
     QString primaryConnectionPath;
     uint32_t state = 0;
     uint32_t connectivity = 0;
+    bool connectivityCheckAvailable = false;
+    bool connectivityCheckEnabled = false;
+    QString connectivityCheckUri;
     QString lastError;
+
+    bool operator==(const ManagerState &) const = default;
 };
 
 struct Snapshot
@@ -117,9 +132,23 @@ struct Snapshot
     QMap<QString, SavedConnectionRecord> savedConnections;
     QMap<QString, ActiveConnectionRecord> activeConnections;
     QDateTime collectedAt;
+
+    bool operator==(const Snapshot &other) const
+    {
+        // collectedAt is intentionally excluded; it changes every refresh even when
+        // the NetworkManager state did not.
+        return manager == other.manager
+            && devices == other.devices
+            && accessPoints == other.accessPoints
+            && savedConnections == other.savedConnections
+            && activeConnections == other.activeConnections;
+    }
 };
 
 bool isVpnType(const QString &type);
+bool isWirelessType(const QString &type);
+bool isUserFacingConnectionType(const QString &type);
+int connectionTypeSortKey(const QString &type);
 QString connectionTypeLabel(const QString &type);
 
 } // namespace nm

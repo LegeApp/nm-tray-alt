@@ -1,58 +1,42 @@
 #include "nm_actions.h"
 
 #include <QDBusConnection>
-#include <QDBusInterface>
-#include <QDBusMessage>
 #include <QDBusObjectPath>
-#include <QDBusReply>
-#include <QProcess>
-#include <QVariant>
-#include <utility>
+#include <QDBusPendingCallWatcher>
+#include <QDBusPendingReply>
+#include <QDBusVariant>
+#include <QtEndian>
 
 namespace
 {
 constexpr const char *kNmService = "org.freedesktop.NetworkManager";
 constexpr const char *kNmPath = "/org/freedesktop/NetworkManager";
 constexpr const char *kNmIface = "org.freedesktop.NetworkManager";
-constexpr const char *kSettingsPath = "/org/freedesktop/NetworkManager/Settings";
-constexpr const char *kSettingsIface = "org.freedesktop.NetworkManager.Settings";
 constexpr const char *kSettingsConnIface = "org.freedesktop.NetworkManager.Settings.Connection";
 constexpr const char *kDeviceIface = "org.freedesktop.NetworkManager.Device";
 constexpr const char *kDeviceWirelessIface = "org.freedesktop.NetworkManager.Device.Wireless";
 constexpr const char *kDbusPropsIface = "org.freedesktop.DBus.Properties";
 
-QString trimmedProcessOutput(const QByteArray &data)
+QDBusObjectPath objectPathOrRoot(const QString &path)
 {
-    return QString::fromLocal8Bit(data).trimmed();
+    return QDBusObjectPath(path.isEmpty() ? QStringLiteral("/") : path);
 }
 
-QString interfaceNameForDevicePath(const QString &devicePath)
+nm::ConnectionSettings settingsFromReply(const QDBusMessage &reply)
 {
-    if (devicePath.isEmpty() || devicePath == QStringLiteral("/")) {
+    if (reply.arguments().isEmpty()) {
         return {};
     }
-
-    QDBusMessage msg = QDBusMessage::createMethodCall(
-        QString::fromLatin1(kNmService), devicePath, QString::fromLatin1(kDbusPropsIface), QStringLiteral("Get"));
-    msg << QString::fromLatin1(kDeviceIface) << QStringLiteral("Interface");
-
-    const QDBusMessage reply = QDBusConnection::systemBus().call(msg);
-    if (reply.type() == QDBusMessage::ErrorMessage || reply.arguments().isEmpty()) {
-        return {};
-    }
-
-    const auto variant = qvariant_cast<QDBusVariant>(reply.arguments().at(0));
-    return variant.variant().toString();
+    return qdbus_cast<nm::ConnectionSettings>(reply.arguments().at(0));
 }
 
-bool callAndCheck(QDBusMessage &&msg, QString *errorMessage)
+bool isHex(const QString &s)
 {
-    const QDBusMessage reply = QDBusConnection::systemBus().call(msg);
-    if (reply.type() == QDBusMessage::ErrorMessage) {
-        if (errorMessage) {
-            *errorMessage = reply.errorMessage();
+    for (const QChar ch : s) {
+        if (!ch.isDigit()
+            && (ch.toLower() < QLatin1Char('a') || ch.toLower() > QLatin1Char('f'))) {
+            return false;
         }
-        return false;
     }
     return true;
 }
@@ -62,145 +46,340 @@ bool callAndCheck(QDBusMessage &&msg, QString *errorMessage)
 namespace nm
 {
 
-NmActions::Result callAndCheckExpected(QDBusMessage &&msg)
+QString humanActionError(const QString &raw)
 {
-    QString error;
-    if (!callAndCheck(std::move(msg), &error)) {
-        return std::unexpected(std::move(error));
+    const QString lower = raw.toLower();
+    if (lower.contains(QStringLiteral("nosecrets")) || lower.contains(QStringLiteral("no secrets"))) {
+        return QObject::tr("A password is needed for this network.");
+    }
+    if (lower.contains(QStringLiteral("notallowed"))
+        || lower.contains(QStringLiteral("not allowed"))
+        || lower.contains(QStringLiteral("unavailable"))) {
+        return QObject::tr("The Wi-Fi adapter is unavailable. Check Wi-Fi or airplane-mode switches.");
+    }
+    if (lower.contains(QStringLiteral("timeout"))) {
+        return QObject::tr("NetworkManager did not answer in time.");
+    }
+    return raw;
+}
+
+QString keyMgmtForAp(uint32_t wpaFlags, uint32_t rsnFlags, bool privacy)
+{
+    const uint32_t all = wpaFlags | rsnFlags;
+    if ((all & 0x400U) != 0U && (all & 0x100U) == 0U) {
+        return QStringLiteral("sae");
+    }
+    if ((all & 0x100U) != 0U) {
+        return QStringLiteral("wpa-psk");
+    }
+    if ((all & 0x200U) != 0U) {
+        return QStringLiteral("wpa-eap");
+    }
+    if ((all & (0x800U | 0x1000U)) != 0U) {
+        return QStringLiteral("owe");
+    }
+    if (privacy) {
+        return QStringLiteral("wpa-psk");
     }
     return {};
 }
 
-NmActions::Result NmActions::activateConnection(const QString &connectionPath, const QString &devicePath, const QString &specificObject)
+bool isWpaPskValid(const QString &password)
 {
-    QDBusMessage msg = QDBusMessage::createMethodCall(
-        QString::fromLatin1(kNmService), QString::fromLatin1(kNmPath), QString::fromLatin1(kNmIface), QStringLiteral("ActivateConnection"));
+    if (password.size() >= 8 && password.size() <= 63) {
+        return true;
+    }
+    return password.size() == 64 && isHex(password);
+}
+
+void NmActions::callAsync(QDBusMessage &&msg, QObject *ctx, AsyncResult done, int timeoutMs)
+{
+    auto pending = QDBusConnection::systemBus().asyncCall(std::move(msg), timeoutMs);
+    auto *watcher = new QDBusPendingCallWatcher(pending, ctx);
+    QObject::connect(watcher, &QDBusPendingCallWatcher::finished, ctx,
+                     [done = std::move(done)](QDBusPendingCallWatcher *w) mutable {
+                         w->deleteLater();
+                         const QDBusMessage reply = w->reply();
+                         const bool ok = !w->isError();
+                         const QString error = ok ? QString{} : humanActionError(w->error().message());
+                         if (done) {
+                             done(ok, error, reply);
+                         }
+                     });
+}
+
+void NmActions::activateConnection(const QString &connectionPath,
+                                   const QString &devicePath,
+                                   const QString &specificObject,
+                                   QObject *ctx,
+                                   AsyncResult done)
+{
+    QDBusMessage msg = QDBusMessage::createMethodCall(QString::fromLatin1(kNmService),
+                                                      QString::fromLatin1(kNmPath),
+                                                      QString::fromLatin1(kNmIface),
+                                                      QStringLiteral("ActivateConnection"));
     msg << QDBusObjectPath(connectionPath)
-        << QDBusObjectPath(devicePath.isEmpty() ? QStringLiteral("/") : devicePath)
-        << QDBusObjectPath(specificObject.isEmpty() ? QStringLiteral("/") : specificObject);
-    return callAndCheckExpected(std::move(msg));
+        << objectPathOrRoot(devicePath)
+        << objectPathOrRoot(specificObject);
+    callAsync(std::move(msg), ctx, std::move(done));
 }
 
-NmActions::Result NmActions::deactivateConnection(const QString &activeConnectionPath)
+void NmActions::deactivateConnection(const QString &activeConnectionPath, QObject *ctx, AsyncResult done)
 {
-    QDBusMessage msg = QDBusMessage::createMethodCall(
-        QString::fromLatin1(kNmService), QString::fromLatin1(kNmPath), QString::fromLatin1(kNmIface), QStringLiteral("DeactivateConnection"));
+    QDBusMessage msg = QDBusMessage::createMethodCall(QString::fromLatin1(kNmService),
+                                                      QString::fromLatin1(kNmPath),
+                                                      QString::fromLatin1(kNmIface),
+                                                      QStringLiteral("DeactivateConnection"));
     msg << QDBusObjectPath(activeConnectionPath);
-    return callAndCheckExpected(std::move(msg));
+    callAsync(std::move(msg), ctx, std::move(done));
 }
 
-NmActions::Result NmActions::disconnectDevice(const QString &devicePath)
+void NmActions::disconnectDevice(const QString &devicePath, QObject *ctx, AsyncResult done)
 {
     if (devicePath.isEmpty() || devicePath == QStringLiteral("/")) {
-        return std::unexpected(QStringLiteral("Invalid device path"));
+        if (done) {
+            done(false, QObject::tr("Invalid device path."), {});
+        }
+        return;
     }
 
-    QDBusMessage msg = QDBusMessage::createMethodCall(
-        QString::fromLatin1(kNmService), devicePath, QString::fromLatin1(kDeviceIface), QStringLiteral("Disconnect"));
-    return callAndCheckExpected(std::move(msg));
+    QDBusMessage msg = QDBusMessage::createMethodCall(QString::fromLatin1(kNmService),
+                                                      devicePath,
+                                                      QString::fromLatin1(kDeviceIface),
+                                                      QStringLiteral("Disconnect"));
+    callAsync(std::move(msg), ctx, std::move(done));
 }
 
-NmActions::Result NmActions::requestScan(const QString &devicePath)
+void NmActions::requestScan(const QString &devicePath, QObject *ctx, AsyncResult done)
 {
-    QDBusMessage msg = QDBusMessage::createMethodCall(
-        QString::fromLatin1(kNmService), devicePath, QString::fromLatin1(kDeviceWirelessIface), QStringLiteral("RequestScan"));
+    QDBusMessage msg = QDBusMessage::createMethodCall(QString::fromLatin1(kNmService),
+                                                      devicePath,
+                                                      QString::fromLatin1(kDeviceWirelessIface),
+                                                      QStringLiteral("RequestScan"));
     msg << QVariantMap{};
-    return callAndCheckExpected(std::move(msg));
+    callAsync(std::move(msg), ctx, std::move(done), 8000);
 }
 
-NmActions::Result NmActions::setNetworkingEnabled(bool enabled)
+void NmActions::setNetworkingEnabled(bool enabled, QObject *ctx, AsyncResult done)
 {
-    QDBusMessage msg = QDBusMessage::createMethodCall(
-        QString::fromLatin1(kNmService), QString::fromLatin1(kNmPath), QString::fromLatin1(kNmIface), QStringLiteral("Enable"));
+    QDBusMessage msg = QDBusMessage::createMethodCall(QString::fromLatin1(kNmService),
+                                                      QString::fromLatin1(kNmPath),
+                                                      QString::fromLatin1(kNmIface),
+                                                      QStringLiteral("Enable"));
     msg << enabled;
-    return callAndCheckExpected(std::move(msg));
+    callAsync(std::move(msg), ctx, std::move(done));
 }
 
-NmActions::Result NmActions::setWirelessEnabled(bool enabled)
+void NmActions::setWirelessEnabled(bool enabled, QObject *ctx, AsyncResult done)
 {
-    QDBusMessage setMsg = QDBusMessage::createMethodCall(
-        QString::fromLatin1(kNmService), QString::fromLatin1(kNmPath), QString::fromLatin1(kDbusPropsIface), QStringLiteral("Set"));
-    setMsg << QString::fromLatin1(kNmIface) << QStringLiteral("WirelessEnabled") << QVariant::fromValue(QDBusVariant(enabled));
-    return callAndCheckExpected(std::move(setMsg));
+    QDBusMessage msg = QDBusMessage::createMethodCall(QString::fromLatin1(kNmService),
+                                                      QString::fromLatin1(kNmPath),
+                                                      QString::fromLatin1(kDbusPropsIface),
+                                                      QStringLiteral("Set"));
+    msg << QString::fromLatin1(kNmIface)
+        << QStringLiteral("WirelessEnabled")
+        << QVariant::fromValue(QDBusVariant(enabled));
+    callAsync(std::move(msg), ctx, std::move(done));
 }
 
-NmActions::Result NmActions::setConnectionAutoconnect(const QString &connectionPath, bool enabled)
+void NmActions::setConnectionAutoconnect(const QString &connectionPath, bool enabled, QObject *ctx, AsyncResult done)
 {
     if (connectionPath.isEmpty() || connectionPath == QStringLiteral("/")) {
-        return std::unexpected(QStringLiteral("Invalid connection path"));
+        if (done) {
+            done(false, QObject::tr("Invalid connection path."), {});
+        }
+        return;
     }
 
-    QDBusMessage getSettings = QDBusMessage::createMethodCall(
-        QString::fromLatin1(kNmService), connectionPath, QString::fromLatin1(kSettingsConnIface), QStringLiteral("GetSettings"));
-    const QDBusMessage reply = QDBusConnection::systemBus().call(getSettings);
-    if (reply.type() == QDBusMessage::ErrorMessage || reply.arguments().isEmpty()) {
-        return std::unexpected(reply.errorMessage().isEmpty() ? QStringLiteral("GetSettings failed") : reply.errorMessage());
-    }
+    QDBusMessage get = QDBusMessage::createMethodCall(QString::fromLatin1(kNmService),
+                                                      connectionPath,
+                                                      QString::fromLatin1(kSettingsConnIface),
+                                                      QStringLiteral("GetSettings"));
+    callAsync(std::move(get), ctx,
+              [connectionPath, enabled, ctx, done = std::move(done)](bool ok, const QString &err, const QDBusMessage &reply) mutable {
+                  if (!ok) {
+                      if (done) {
+                          done(false, err, reply);
+                      }
+                      return;
+                  }
+                  ConnectionSettings settings = settingsFromReply(reply);
+                  QVariantMap connection = settings.value(QStringLiteral("connection"));
+                  connection.insert(QStringLiteral("autoconnect"), enabled);
+                  settings.insert(QStringLiteral("connection"), connection);
 
-    const QVariantMap settings = qdbus_cast<QVariantMap>(reply.arguments().at(0));
-    if (settings.isEmpty()) {
-        return std::unexpected(QStringLiteral("Connection settings payload was empty"));
-    }
-
-    QVariantMap updated = settings;
-    QVariantMap connection = updated.value(QStringLiteral("connection")).toMap();
-    connection.insert(QStringLiteral("autoconnect"), enabled);
-    updated.insert(QStringLiteral("connection"), QVariant::fromValue(connection));
-
-    QDBusMessage update = QDBusMessage::createMethodCall(
-        QString::fromLatin1(kNmService), connectionPath, QString::fromLatin1(kSettingsConnIface), QStringLiteral("Update"));
-    update << updated;
-    return callAndCheckExpected(std::move(update));
+                  QDBusMessage update = QDBusMessage::createMethodCall(QString::fromLatin1(kNmService),
+                                                                       connectionPath,
+                                                                       QString::fromLatin1(kSettingsConnIface),
+                                                                       QStringLiteral("Update"));
+                  update << QVariant::fromValue(settings);
+                  callAsync(std::move(update), ctx, std::move(done));
+              });
 }
 
-NmActions::Result NmActions::addWifiConnection(const QString &ssid, const QString &password, const QString &devicePath, bool secure)
+void NmActions::addAndActivateWifi(const AccessPointRecord &ap,
+                                   const QString &devicePath,
+                                   const QString &password,
+                                   QObject *ctx,
+                                   AsyncResult done,
+                                   bool hidden)
 {
-    if (ssid.isEmpty() || devicePath.isEmpty()) {
-        return std::unexpected(QStringLiteral("SSID and device path are required"));
+    if (ap.ssidBytes.isEmpty() || devicePath.isEmpty() || devicePath == QStringLiteral("/")) {
+        if (done) {
+            done(false, QObject::tr("SSID and a usable Wi-Fi adapter are required."), {});
+        }
+        return;
     }
 
-    const QString trimmedPassword = password.trimmed();
-    if (secure && trimmedPassword.isEmpty()) {
-        return std::unexpected(QStringLiteral("Password is required for this Wi-Fi network"));
+    const QString keyMgmt = keyMgmtForAp(ap.wpaFlags, ap.rsnFlags, ap.privacy);
+    if (keyMgmt == QLatin1String("wpa-eap")) {
+        if (done) {
+            done(false,
+                 QObject::tr("Enterprise Wi-Fi needs more settings than a password. Open the connection editor to create this profile."),
+                 {});
+        }
+        return;
+    }
+    if ((keyMgmt == QLatin1String("wpa-psk") || keyMgmt == QLatin1String("sae")) && !isWpaPskValid(password)) {
+        if (done) {
+            done(false, QObject::tr("WPA/WPA2/WPA3 passwords must be 8–63 characters, or exactly 64 hex digits."), {});
+        }
+        return;
     }
 
-    QStringList args{
-        QStringLiteral("--wait"),
-        QStringLiteral("20"),
-        QStringLiteral("device"),
-        QStringLiteral("wifi"),
-        QStringLiteral("connect"),
-        ssid,
+    QVariantMap connection{
+        { QStringLiteral("id"), QString::fromUtf8(ap.ssidBytes) },
+        { QStringLiteral("type"), QStringLiteral("802-11-wireless") },
+        { QStringLiteral("autoconnect"), true },
     };
-
-    const QString interfaceName = interfaceNameForDevicePath(devicePath);
-    if (!interfaceName.isEmpty()) {
-        args << QStringLiteral("ifname") << interfaceName;
+    QVariantMap wireless{
+        { QStringLiteral("ssid"), ap.ssidBytes },
+        { QStringLiteral("mode"), QStringLiteral("infrastructure") },
+    };
+    if (hidden) {
+        wireless.insert(QStringLiteral("hidden"), true);
     }
 
-    if (secure) {
-        args << QStringLiteral("password") << trimmedPassword;
+    ConnectionSettings settings;
+    settings.insert(QStringLiteral("connection"), connection);
+    settings.insert(QStringLiteral("802-11-wireless"), wireless);
+
+    if (!keyMgmt.isEmpty()) {
+        QVariantMap security{ { QStringLiteral("key-mgmt"), keyMgmt } };
+        if (keyMgmt != QLatin1String("owe")) {
+            security.insert(QStringLiteral("psk"), password);
+            security.insert(QStringLiteral("psk-flags"), 0U);
+        }
+        settings.insert(QStringLiteral("802-11-wireless-security"), security);
     }
 
-    QProcess nmcli;
-    nmcli.start(QStringLiteral("nmcli"), args, QIODevice::ReadOnly);
-    if (!nmcli.waitForStarted(5000)) {
-        return std::unexpected(QStringLiteral("Failed to start nmcli"));
-    }
-    if (!nmcli.waitForFinished(30000)) {
-        nmcli.kill();
-        nmcli.waitForFinished(2000);
-        return std::unexpected(QStringLiteral("Timed out while connecting to '%1'").arg(ssid));
+    QDBusMessage msg = QDBusMessage::createMethodCall(QString::fromLatin1(kNmService),
+                                                      QString::fromLatin1(kNmPath),
+                                                      QString::fromLatin1(kNmIface),
+                                                      QStringLiteral("AddAndActivateConnection"));
+    msg << QVariant::fromValue(settings)
+        << QDBusObjectPath(devicePath)
+        << objectPathOrRoot(ap.path);
+    callAsync(std::move(msg), ctx, std::move(done), 30000);
+}
+
+void NmActions::updateSavedPsk(const QString &connectionPath,
+                               const QString &password,
+                               QObject *ctx,
+                               AsyncResult done)
+{
+    if (!isWpaPskValid(password)) {
+        if (done) {
+            done(false, QObject::tr("WPA/WPA2/WPA3 passwords must be 8–63 characters, or exactly 64 hex digits."), {});
+        }
+        return;
     }
 
-    if (nmcli.exitStatus() != QProcess::NormalExit || nmcli.exitCode() != 0) {
-        const QString stderrText = trimmedProcessOutput(nmcli.readAllStandardError());
-        const QString stdoutText = trimmedProcessOutput(nmcli.readAllStandardOutput());
-        const QString message = !stderrText.isEmpty() ? stderrText : (!stdoutText.isEmpty() ? stdoutText : QStringLiteral("nmcli failed"));
-        return std::unexpected(message);
-    }
+    QDBusMessage get = QDBusMessage::createMethodCall(QString::fromLatin1(kNmService),
+                                                      connectionPath,
+                                                      QString::fromLatin1(kSettingsConnIface),
+                                                      QStringLiteral("GetSettings"));
+    callAsync(std::move(get), ctx,
+              [connectionPath, password, ctx, done = std::move(done)](bool ok, const QString &err, const QDBusMessage &reply) mutable {
+                  if (!ok) {
+                      if (done) {
+                          done(false, err, reply);
+                      }
+                      return;
+                  }
 
-    return {};
+                  ConnectionSettings settings = settingsFromReply(reply);
+                  QVariantMap security = settings.value(QStringLiteral("802-11-wireless-security"));
+                  security.insert(QStringLiteral("psk"), password);
+                  security.insert(QStringLiteral("psk-flags"), 0U);
+                  if (!security.contains(QStringLiteral("key-mgmt"))) {
+                      security.insert(QStringLiteral("key-mgmt"), QStringLiteral("wpa-psk"));
+                  }
+                  settings.insert(QStringLiteral("802-11-wireless-security"), security);
+
+                  QDBusMessage update = QDBusMessage::createMethodCall(QString::fromLatin1(kNmService),
+                                                                       connectionPath,
+                                                                       QString::fromLatin1(kSettingsConnIface),
+                                                                       QStringLiteral("Update"));
+                  update << QVariant::fromValue(settings);
+                  callAsync(std::move(update), ctx, std::move(done));
+              });
+}
+
+void NmActions::applyPublicDns(const QString &connectionPath,
+                               const QString &activeConnectionPath,
+                               QObject *ctx,
+                               AsyncResult done)
+{
+    QDBusMessage get = QDBusMessage::createMethodCall(QString::fromLatin1(kNmService),
+                                                      connectionPath,
+                                                      QString::fromLatin1(kSettingsConnIface),
+                                                      QStringLiteral("GetSettings"));
+    callAsync(std::move(get), ctx,
+              [connectionPath, activeConnectionPath, ctx, done = std::move(done)](bool ok, const QString &err, const QDBusMessage &reply) mutable {
+                  if (!ok) {
+                      if (done) {
+                          done(false, err, reply);
+                      }
+                      return;
+                  }
+
+                  ConnectionSettings settings = settingsFromReply(reply);
+                  QVariantMap ipv4 = settings.value(QStringLiteral("ipv4"));
+                  ipv4.insert(QStringLiteral("dns"),
+                              QVariant::fromValue(QList<uint>{ qToBigEndian(0x01010101U),
+                                                               qToBigEndian(0x09090909U) }));
+                  ipv4.insert(QStringLiteral("ignore-auto-dns"), true);
+                  if (!ipv4.contains(QStringLiteral("method"))) {
+                      ipv4.insert(QStringLiteral("method"), QStringLiteral("auto"));
+                  }
+                  settings.insert(QStringLiteral("ipv4"), ipv4);
+
+                  QDBusMessage update = QDBusMessage::createMethodCall(QString::fromLatin1(kNmService),
+                                                                       connectionPath,
+                                                                       QString::fromLatin1(kSettingsConnIface),
+                                                                       QStringLiteral("Update"));
+                  update << QVariant::fromValue(settings);
+                  callAsync(std::move(update), ctx,
+                            [connectionPath, activeConnectionPath, ctx, done = std::move(done)](bool ok2,
+                                                                                                 const QString &err2,
+                                                                                                 const QDBusMessage &reply2) mutable {
+                                if (!ok2 || activeConnectionPath.isEmpty()) {
+                                    if (done) {
+                                        done(ok2, err2, reply2);
+                                    }
+                                    return;
+                                }
+                                // Deactivation lets NM re-activate with the changed DNS; the user can also
+                                // reconnect manually if policy blocks autoconnect.
+                                QDBusMessage deactivate = QDBusMessage::createMethodCall(QString::fromLatin1(kNmService),
+                                                                                         QString::fromLatin1(kNmPath),
+                                                                                         QString::fromLatin1(kNmIface),
+                                                                                         QStringLiteral("DeactivateConnection"));
+                                deactivate << QDBusObjectPath(activeConnectionPath);
+                                callAsync(std::move(deactivate), ctx, std::move(done));
+                            });
+              });
 }
 
 } // namespace nm

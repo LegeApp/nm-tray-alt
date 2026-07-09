@@ -25,12 +25,21 @@ COPYRIGHT_HEADER*/
 #include <QMenu>
 #include <QMessageBox>
 #include <QApplication>
+#include <QCursor>
 #include <QPersistentModelIndex>
+#include <QPainter>
+#include <QProcess>
+#include <QSettings>
+#include <QSet>
+#include <QTimer>
+#include <QUrl>
 
 #include "icons.h"
 #include "nmmodel.h"
 #include "autotz.h"
 #include "nmproxy.h"
+#include "backend/connectivity_monitor.h"
+#include "backend/tray_secret_agent.h"
 #include "log.h"
 #include "dbus/org.freedesktop.Notifications.h"
 
@@ -41,6 +50,7 @@ COPYRIGHT_HEADER*/
 // config keys
 static const QString ENABLE_NOTIFICATIONS = QStringLiteral("enableNotifications");
 static const QString CONNECTIONS_EDITOR = QStringLiteral("connectionsEditor");
+static const QString AUTO_TZ_ENABLED = QStringLiteral("autoTimezoneEnabled");
 
 class TrayPrivate
 {
@@ -53,6 +63,10 @@ public:
     void refreshIcon();
     void openCloseDialog(QDialog * dialog);
     void notify(QModelIndex const & index, bool removing);
+    void sendNotification(const QString &summary, const QString &body, const QString &icon = {});
+    void feedConnectivity();
+    void updateTooltip();
+    void onActiveDiff();
 
 public:
     QSystemTrayIcon mTrayIcon;
@@ -68,6 +82,7 @@ public:
     QPersistentModelIndex mPrimaryConnection;
     QPersistentModelIndex mShownConnection;
     QList<QPersistentModelIndex> mConnectionsToNotify; //!< just "created" connections to which notification wasn't sent yet
+    QSet<QString> mAnnouncedActive;
     icons::Icon mIconCurrent;
     icons::Icon mIcon2Show;
     QTimer mIconTimer;
@@ -75,10 +90,13 @@ public:
     QScopedPointer<QDialog> mInfoDialog;
 
     org::freedesktop::Notifications mNotification;
+    nm::ConnectivityMonitor mConnectivity;
+    nm::TraySecretAgent mSecretAgent;
     QScopedPointer<AutoTz> mAutoTz;
 
     // configuration
     bool mEnableNotifications; //!< should info about connection establishment etc. be sent by org.freedesktop.Notifications
+    QAction *mActAutoTz = nullptr;
 };
 
 TrayPrivate::TrayPrivate()
@@ -89,8 +107,6 @@ TrayPrivate::TrayPrivate()
 
 void TrayPrivate::updateState(QModelIndex const & index, bool removing)
 {
-    notify(index, removing);
-
     const auto state = static_cast<NmModel::ActiveConnectionState>(mActiveConnections.data(index, NmModel::ActiveConnectionStateRole).toInt());
     const bool is_primary = mPrimaryConnection == index;
 //qCDebug(NM_TRAY) << __FUNCTION__ << index << removing << mActiveConnections.data(index, NmModel::NameRole) << mActiveConnections.data(index, NmModel::ConnectionUuidRole).toString() << is_primary << mActiveConnections.data(index, NmModel::ConnectionTypeRole).toInt() << state;
@@ -115,17 +131,7 @@ void TrayPrivate::updateState(QModelIndex const & index, bool removing)
             setShown(mPrimaryConnection);
         }
     }
-    //TODO: optimize this text assembly (to not do it every time)?
-    if (mPrimaryConnection.isValid())
-    {
-        mTrayIcon.setToolTip(Tray::tr("<pre>Connection <strong>%1</strong>(%2) active</pre>")
-                .arg(mPrimaryConnection.data(NmModel::NameRole).toString())
-                .arg(mPrimaryConnection.data(NmModel::ActiveConnectionTypeStringRole).toString())
-                );
-    } else
-    {
-        mTrayIcon.setToolTip(Tray::tr("<pre>No active connection</pre>"));
-    }
+    updateTooltip();
 }
 
 void TrayPrivate::primaryConnectionUpdate()
@@ -171,7 +177,20 @@ void TrayPrivate::refreshIcon()
 {
     //Note: the icons::getIcon chooses the right icon from list of possible candidates
     // -> we need to refresh the icon in case of icon theme change
-    mTrayIcon.setIcon(icons::getIcon(mIconCurrent, false));
+    QIcon base = icons::getIcon(mIconCurrent, false);
+    if (mConnectivity.status() == nm::InternetStatus::NoInternet
+        || mConnectivity.status() == nm::InternetStatus::Portal) {
+        QPixmap px = base.pixmap(64, 64);
+        QPainter p(&px);
+        const QPixmap badge = QIcon::fromTheme(mConnectivity.status() == nm::InternetStatus::Portal
+                                                ? QStringLiteral("dialog-warning")
+                                                : QStringLiteral("emblem-important")).pixmap(28, 28);
+        p.drawPixmap(px.width() - badge.width(), px.height() - badge.height(), badge);
+        p.end();
+        mTrayIcon.setIcon(QIcon(px));
+        return;
+    }
+    mTrayIcon.setIcon(base);
 }
 
 void TrayPrivate::openCloseDialog(QDialog * dialog)
@@ -224,12 +243,77 @@ void TrayPrivate::notify(QModelIndex const & index, bool removing)
             , -1);
 }
 
+void TrayPrivate::sendNotification(const QString &summary, const QString &body, const QString &icon)
+{
+    if (!mEnableNotifications) {
+        return;
+    }
+    mNotification.Notify(Tray::tr("NetworkManager(nm-tray-alt)"),
+                         0,
+                         icon,
+                         summary,
+                         body,
+                         {},
+                         {},
+                         8000);
+}
+
+void TrayPrivate::feedConnectivity()
+{
+    const auto s = mNmModel.managerState();
+    mConnectivity.updateFromSnapshot(s.rawNmState,
+                                     s.rawConnectivity,
+                                     s.connectivityCheckEnabled,
+                                     QUrl(s.connectivityCheckUri));
+    updateTooltip();
+}
+
+void TrayPrivate::updateTooltip()
+{
+    if (mPrimaryConnection.isValid()) {
+        mTrayIcon.setToolTip(Tray::tr("<pre>Connection <strong>%1</strong> (%2) active\n%3</pre>")
+                .arg(mPrimaryConnection.data(NmModel::NameRole).toString().toHtmlEscaped(),
+                     mPrimaryConnection.data(NmModel::ActiveConnectionTypeStringRole).toString().toHtmlEscaped(),
+                     mConnectivity.statusText().toHtmlEscaped()));
+    } else {
+        mTrayIcon.setToolTip(Tray::tr("<pre>No active connection\n%1</pre>")
+                .arg(mConnectivity.statusText().toHtmlEscaped()));
+    }
+}
+
+void TrayPrivate::onActiveDiff()
+{
+    if (!mEnableNotifications) {
+        return;
+    }
+    QSet<QString> current;
+    for (const auto &active : mNmModel.activeConnections()) {
+        current.insert(active.path);
+        if (active.state == nm::ActiveState::Activated && !mAnnouncedActive.contains(active.path)) {
+            mAnnouncedActive.insert(active.path);
+            sendNotification(Tray::tr("Connection established"),
+                             Tray::tr("Now connected to %1 '%2'.")
+                                 .arg(nm::connectionTypeLabel(active.type), active.id),
+                             QStringLiteral("network-transmit-receive"));
+        }
+    }
+    for (auto it = mAnnouncedActive.begin(); it != mAnnouncedActive.end();) {
+        if (!current.contains(*it)) {
+            sendNotification(Tray::tr("Connection lost"), Tray::tr("No longer connected."), QStringLiteral("network-offline"));
+            it = mAnnouncedActive.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 
 Tray::Tray(QObject *parent/* = nullptr*/)
     : QObject{parent}
     , d{new TrayPrivate}
 {
     d->mEnableNotifications = QSettings{}.value(ENABLE_NOTIFICATIONS, true).toBool();
+    d->mSecretAgent.registerAgent();
 
     connect(&d->mTrayIcon, &QSystemTrayIcon::activated, this, &Tray::onActivated);
 
@@ -255,6 +339,7 @@ Tray::Tray(QObject *parent/* = nullptr*/)
     d->mActConnInfo = d->mContextMenu.addAction(QIcon::fromTheme(QStringLiteral("dialog-information")), Tray::tr("Connection information"));
     d->mActDebugInfo = d->mContextMenu.addAction(QIcon::fromTheme(QStringLiteral("dialog-information")), Tray::tr("Debug information"));
     d->mRequestScan = d->mContextMenu.addAction(QIcon::fromTheme(QStringLiteral("view-refresh")), Tray::tr("Wi-Fi - request scan"));
+    d->mActAutoTz = d->mContextMenu.addAction(Tray::tr("Set timezone automatically"));
     connect(d->mContextMenu.addAction(QIcon::fromTheme(QStringLiteral("document-edit")), Tray::tr("Edit connections...")), &QAction::triggered
             , this, &Tray::onEditConnectionsTriggered);
     d->mContextMenu.addSeparator();
@@ -267,21 +352,20 @@ Tray::Tray(QObject *parent/* = nullptr*/)
 
     d->mActEnableNetwork->setCheckable(true);
     d->mActEnableWifi->setCheckable(true);
+    d->mActAutoTz->setCheckable(true);
     enable_notifications->setCheckable(true);
     enable_notifications->setChecked(d->mEnableNotifications);
+    d->mActAutoTz->setChecked(QSettings{}.value(AUTO_TZ_ENABLED, false).toBool());
     connect(d->mActEnableNetwork, &QAction::triggered, &d->mNmModel, &NmModel::setNetworkingEnabled);
     connect(d->mActEnableWifi, &QAction::triggered, &d->mNmModel, &NmModel::setWirelessEnabled);
     connect(enable_notifications, &QAction::triggered, this, [this] (bool checked) { d->mEnableNotifications = checked; QSettings{}.setValue(ENABLE_NOTIFICATIONS, checked); });
-    connect(d->mActConnInfo, &QAction::triggered, this, [this] (bool ) {
-        if (d->mInfoDialog.isNull())
-        {
-            d->mInfoDialog.reset(new ConnectionInfo{&d->mNmModel});
-            connect(d->mInfoDialog.data(), &QDialog::finished, [this] {
-                d->mInfoDialog.reset(nullptr);
-            });
+    connect(d->mActAutoTz, &QAction::triggered, this, [this](bool checked) {
+        QSettings{}.setValue(AUTO_TZ_ENABLED, checked);
+        if (d->mAutoTz) {
+            d->mAutoTz->setEnabled(checked);
         }
-        d->openCloseDialog(d->mInfoDialog.data());
     });
+    connect(d->mActConnInfo, &QAction::triggered, this, [this] (bool ) { showConnectionInfo(); });
     connect(d->mActDebugInfo, &QAction::triggered, this, [this] (bool ) {
         if (d->mConnDialog.isNull())
         {
@@ -295,38 +379,61 @@ Tray::Tray(QObject *parent/* = nullptr*/)
     connect(d->mRequestScan, &QAction::triggered, &d->mNmModel, &NmModel::requestAllWifiScan);
 
     d->mAutoTz.reset(new AutoTz(&d->mNmModel));
+    d->mAutoTz->setEnabled(d->mActAutoTz->isChecked());
 
     d->primaryConnectionUpdate();
     setActionsStates();
 
     connect(&d->mNmModel, &NmModel::managerStateChanged, &d->mStateTimer, static_cast<void (QTimer::*)()>(&QTimer::start));
     connect(&d->mNmModel, &NmModel::managerStateChanged, this, &Tray::onPrimaryConnectionChanged);
+    connect(&d->mNmModel, &NmModel::managerStateChanged, this, [this] {
+        d->feedConnectivity();
+        d->onActiveDiff();
+    });
+    connect(&d->mNmModel, &NmModel::actionFailed, this, [this](const QString &summary, const QString &detail) {
+        d->sendNotification(summary, detail, QStringLiteral("dialog-error"));
+    });
+    connect(&d->mConnectivity, &nm::ConnectivityMonitor::statusChanged, this, [this] {
+        d->refreshIcon();
+        d->updateTooltip();
+    });
+    d->feedConnectivity();
 
     connect(&d->mActiveConnections, &QAbstractItemModel::rowsInserted, [this] (QModelIndex const & parent, int first, int last) {
         for (int i = first; i <= last; ++i)
         {
             const QModelIndex index = d->mActiveConnections.index(i, 0, parent);
 //qCDebug(NM_TRAY) << "rowsInserted" << index;
-            if (d->mEnableNotifications)
-            {
-                d->mConnectionsToNotify.append(index);
-            }
             d->updateState(index, false);
         }
+        d->onActiveDiff();
     });
     connect(&d->mActiveConnections, &QAbstractItemModel::rowsAboutToBeRemoved, [this] (QModelIndex const & parent, int first, int last) {
 //qCDebug(NM_TRAY) << "rowsAboutToBeRemoved";
         for (int i = first; i <= last; ++i)
             d->updateState(d->mActiveConnections.index(i, 0, parent), true);
+        d->onActiveDiff();
     });
     connect(&d->mActiveConnections, &QAbstractItemModel::dataChanged, [this] (const QModelIndex & topLeft, const QModelIndex & bottomRight, const QVector<int> & /*roles*/) {
 //qCDebug(NM_TRAY) << "dataChanged";
         for (auto const & i : QItemSelection{topLeft, bottomRight}.indexes())
             d->updateState(i, false);
+        d->onActiveDiff();
     });
 
     d->mTrayIcon.setContextMenu(&d->mContextMenu);
-    QTimer::singleShot(0, [this] { d->mTrayIcon.show(); });
+    auto *trayWait = new QTimer(this);
+    trayWait->setInterval(1000);
+    auto showTrayWhenAvailable = [this, trayWait] {
+        if (QSystemTrayIcon::isSystemTrayAvailable()) {
+            d->mTrayIcon.show();
+            trayWait->stop();
+            trayWait->deleteLater();
+        }
+    };
+    connect(trayWait, &QTimer::timeout, this, showTrayWhenAvailable);
+    trayWait->start();
+    QTimer::singleShot(0, this, showTrayWhenAvailable);
 }
 
 Tray::~Tray()
@@ -400,8 +507,9 @@ void Tray::onActivated(const QSystemTrayIcon::ActivationReason reason)
         case QSystemTrayIcon::Trigger:
         case QSystemTrayIcon::DoubleClick:
             {
-                QMenu * menu = new WindowMenu(&d->mNmModel);
+                auto * menu = new WindowMenu(&d->mNmModel, &d->mConnectivity);
                 menu->setAttribute(Qt::WA_DeleteOnClose);
+                connect(menu, &WindowMenu::requestConnectionInfo, this, &Tray::showConnectionInfo);
                 menu->popup(QCursor::pos());
             }
             break;
@@ -427,4 +535,17 @@ void Tray::setActionsStates()
 void Tray::onPrimaryConnectionChanged()
 {
     d->primaryConnectionUpdate();
+}
+
+void Tray::showConnectionInfo()
+{
+    if (d->mInfoDialog.isNull())
+    {
+        d->mInfoDialog.reset(new ConnectionInfo{&d->mNmModel});
+        d->mInfoDialog->setAttribute(Qt::WA_DeleteOnClose, false);
+        connect(d->mInfoDialog.data(), &QDialog::finished, this, [this] {
+            d->mInfoDialog.reset(nullptr);
+        });
+    }
+    d->openCloseDialog(d->mInfoDialog.data());
 }

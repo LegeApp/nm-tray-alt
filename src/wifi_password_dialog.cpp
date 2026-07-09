@@ -1,4 +1,5 @@
 #include "wifi_password_dialog.h"
+#include "backend/nm_actions.h"
 
 #include <QVBoxLayout>
 #include <QLabel>
@@ -30,6 +31,12 @@ WifiPasswordDialog::WifiPasswordDialog(const QString &ssid, bool secure, QWidget
     mSsidLabel->setStyleSheet("color: #666; margin: 8px 0;");
     layout->addWidget(mSsidLabel);
 
+    mInfoLabel = new QLabel();
+    mInfoLabel->setWordWrap(true);
+    mInfoLabel->setStyleSheet("color: #555; background-color: #eef5ff; padding: 8px; border: 1px solid #9dc2f0; border-radius: 4px;");
+    mInfoLabel->hide();
+    layout->addWidget(mInfoLabel);
+
     if (mSecure) {
         auto *passwordLabel = new QLabel(tr("Password:"));
         layout->addWidget(passwordLabel);
@@ -44,8 +51,14 @@ WifiPasswordDialog::WifiPasswordDialog(const QString &ssid, bool secure, QWidget
             }
         });
         layout->addWidget(mPasswordEdit);
+
+        mValidationLabel = new QLabel(tr("Use 8–63 characters, or exactly 64 hex digits."));
+        mValidationLabel->setWordWrap(true);
+        mValidationLabel->setStyleSheet("color: #666;");
+        layout->addWidget(mValidationLabel);
     } else {
         mPasswordEdit = nullptr;
+        mValidationLabel = nullptr;
     }
 
     if (!mSecure) {
@@ -87,6 +100,12 @@ QString WifiPasswordDialog::password() const
     return mPasswordEdit ? mPasswordEdit->text() : QString();
 }
 
+void WifiPasswordDialog::setInfoText(const QString &text)
+{
+    mInfoLabel->setText(text);
+    mInfoLabel->setVisible(!text.isEmpty());
+}
+
 bool WifiPasswordDialog::connectAnyway() const
 {
     return false;
@@ -94,8 +113,11 @@ bool WifiPasswordDialog::connectAnyway() const
 
 void WifiPasswordDialog::onPasswordChanged()
 {
-    const bool hasPassword = mPasswordEdit && !mPasswordEdit->text().trimmed().isEmpty();
-    mConnectButton->setEnabled(hasPassword);
+    const bool valid = mPasswordEdit && nm::isWpaPskValid(mPasswordEdit->text());
+    mConnectButton->setEnabled(valid);
+    if (mValidationLabel != nullptr) {
+        mValidationLabel->setStyleSheet(valid ? QStringLiteral("color: #2e7d32;") : QStringLiteral("color: #b00020;"));
+    }
 }
 
 void WifiPasswordDialog::onConnectAnyway()

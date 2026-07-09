@@ -38,12 +38,16 @@ set(SRCS
     src/log.cpp
     src/icons.cpp
     src/backend/nm_types.cpp
+    src/backend/connectivity_monitor.cpp
+    src/backend/wifi_activation_watcher.cpp
+    src/backend/tray_secret_agent.cpp
     src/backend/nm_dbus_client.cpp
     src/backend/nm_actions.cpp
     src/backend/nm_cache.cpp
     src/nmmodel.cpp
     src/nmproxy.cpp
     src/connectioninfo.cpp
+    src/troubleshootdialog.cpp
     src/nmlist.cpp
     src/menuview.cpp
     src/windowmenu.cpp

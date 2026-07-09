@@ -6,6 +6,7 @@
 #include <QObject>
 #include <QSet>
 #include <QTimer>
+#include <QDBusMessage>
 
 namespace nm
 {
@@ -27,7 +28,7 @@ public Q_SLOTS:
 
 private Q_SLOTS:
     void onManagerSignal();
-    void onPropertiesChanged(QString interfaceName, QVariantMap changedProperties, QStringList invalidatedProperties);
+    void onPropertiesChanged(QString interfaceName, QVariantMap changedProperties, QStringList invalidatedProperties, QDBusMessage msg);
     void scheduleRefresh();
 
 private:

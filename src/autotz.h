@@ -14,6 +14,8 @@ class AutoTz : public QObject
     Q_OBJECT
 public:
     explicit AutoTz(NmModel *model, QObject *parent = nullptr);
+    void setEnabled(bool enabled);
+    bool isEnabled() const { return mEnabled; }
 
 private Q_SLOTS:
     void onManagerStateChanged();
@@ -39,6 +41,7 @@ private:
     int mNextService = 0;
     bool mLookupInProgress = false;
     bool mUsingCurl = false;
+    bool mEnabled = false;
 };
 
 #endif

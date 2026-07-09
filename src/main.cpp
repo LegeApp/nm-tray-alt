@@ -21,9 +21,15 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
 COPYRIGHT_HEADER*/
 #include <QApplication>
+#include <QDBusMetaType>
+#include <QLockFile>
+#include <QDir>
+#include <QMessageBox>
+#include <QStandardPaths>
 
 #include "tray.h"
 
+#include "backend/nm_actions.h"
 #include "icons.h"
 
 int main(int argc, char * argv[])
@@ -33,6 +39,22 @@ int main(int argc, char * argv[])
     app.setApplicationName(QStringLiteral("nm-tray-alt"));
     app.setWindowIcon(icons::getIcon(icons::PREFERENCES_NETWORK, true));
     app.setQuitOnLastWindowClosed(false);
+
+    qDBusRegisterMetaType<nm::ConnectionSettings>();
+    qDBusRegisterMetaType<QList<uint>>();
+
+    QString runtimeDir = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation);
+    if (runtimeDir.isEmpty()) {
+        runtimeDir = QDir::tempPath();
+    }
+    QLockFile lock(QDir(runtimeDir).filePath(QStringLiteral("nm-tray-alt.lock")));
+    lock.setStaleLockTime(0);
+    if (!lock.tryLock(100)) {
+        QMessageBox::information(nullptr,
+                                 QObject::tr("nm-tray-alt"),
+                                 QObject::tr("nm-tray-alt is already running."));
+        return 0;
+    }
 
     Tray tray;
     

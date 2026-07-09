@@ -213,7 +213,7 @@ void NmProxy::onSourceRowsAboutToBeMoved( const QModelIndex &sourceParent, int s
     if (root == sourceParent)
     {
         if (root == destinationParent)
-            beginMoveRows(mapFromSource(sourceParent), sourceStart, sourceEnd, destinationParent, destinationRow);
+            beginMoveRows(mapFromSource(sourceParent), sourceStart, sourceEnd, mapFromSource(destinationParent), destinationRow);
         else
             beginRemoveRows(mapFromSource(sourceParent), sourceStart, sourceEnd);
     } else if (root == destinationParent)
@@ -256,4 +256,3 @@ void NmProxy::onSourceColumnsMoved( const QModelIndex &sourceParent, int, int, c
     } else if (root == destinationParent)
         endInsertColumns();
 }
-

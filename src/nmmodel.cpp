@@ -1,35 +1,36 @@
 #include "nmmodel.h"
 
 #include "backend/nm_actions.h"
+#include "backend/wifi_activation_watcher.h"
 #include "icons.h"
 #include "log.h"
 #include "wifi_password_dialog.h"
 
+#include <QCheckBox>
+#include <QDBusObjectPath>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QLocale>
 #include <QMetaObject>
 #include <QMetaType>
+#include <QFormLayout>
 #include <QApplication>
+#include <QLabel>
+#include <QLineEdit>
+#include <QPushButton>
+#include <QSet>
 #include <algorithm>
 
 namespace
 {
 int connTypeToInt(const QString &type)
 {
-    if (type == QStringLiteral("802-11-wireless")) {
-        return 1;
-    }
-    if (type == QStringLiteral("802-3-ethernet")) {
-        return 2;
-    }
-    if (nm::isVpnType(type)) {
-        return 3;
-    }
-    return 4;
+    return nm::connectionTypeSortKey(type);
 }
 
 bool isWirelessType(const QString &type)
 {
-    return type == QStringLiteral("802-11-wireless");
+    return nm::isWirelessType(type);
 }
 
 QString formatBytes(qulonglong bytes)
@@ -46,6 +47,66 @@ QString formatBytes(qulonglong bytes)
         + QLatin1String(units[unit]);
 }
 
+struct WifiTarget
+{
+    QString devicePath;
+    QString apPath;
+};
+
+WifiTarget pickWifiTarget(const nm::Snapshot &snapshot,
+                          const QString &ifaceHint,
+                          const QByteArray &ssidBytes)
+{
+    WifiTarget fallback;
+    for (const auto &dev : snapshot.devices) {
+        if (dev.type != nm::DeviceType::Wifi) {
+            continue;
+        }
+        if (!ifaceHint.isEmpty() && dev.interfaceName != ifaceHint) {
+            continue;
+        }
+        if (dev.state < 30) {
+            continue;
+        }
+        if (fallback.devicePath.isEmpty()) {
+            fallback.devicePath = dev.path;
+        }
+        for (const QString &apPath : dev.accessPointPaths) {
+            const auto apIt = snapshot.accessPoints.find(apPath);
+            if (apIt != snapshot.accessPoints.end() && apIt->ssidBytes == ssidBytes) {
+                return { dev.path, apPath };
+            }
+        }
+    }
+    return fallback;
+}
+
+QString firstObjectPathFromReply(const QDBusMessage &reply)
+{
+    for (const QVariant &arg : reply.arguments()) {
+        if (arg.canConvert<QDBusObjectPath>()) {
+            const QString path = arg.value<QDBusObjectPath>().path();
+            if (!path.isEmpty() && path != QStringLiteral("/")) {
+                return path;
+            }
+        }
+    }
+    return {};
+}
+
+QString lastObjectPathFromReply(const QDBusMessage &reply)
+{
+    for (auto it = reply.arguments().crbegin(); it != reply.arguments().crend(); ++it) {
+        if (it->canConvert<QDBusObjectPath>()) {
+            const QString path = it->value<QDBusObjectPath>().path();
+            if (!path.isEmpty() && path != QStringLiteral("/")) {
+                return path;
+            }
+        }
+    }
+    return {};
+}
+
 NmModel::OverallState toOverallState(uint nmState, uint connectivity)
 {
     // NM states: 20 disconnected, 40 connecting, 50 connected(local), 60 connected(site), 70 connected(global)
@@ -53,10 +114,10 @@ NmModel::OverallState toOverallState(uint nmState, uint connectivity)
         return NmModel::OverallState::Connecting;
     }
     if (nmState == 50 || nmState == 60 || nmState == 70) {
-        if (connectivity == 1 || connectivity == 2 || connectivity == 3) {
+        if (connectivity == 2 || connectivity == 3) {
             return NmModel::OverallState::Limited;
         }
-        return NmModel::OverallState::Connected;
+        return connectivity == 1 ? NmModel::OverallState::Disconnected : NmModel::OverallState::Connected;
     }
     return NmModel::OverallState::Disconnected;
 }
@@ -72,75 +133,32 @@ bool managerStateEquivalent(const NmModel::ManagerState &a, const NmModel::Manag
         && a.networkingEnabled == b.networkingEnabled
         && a.wirelessEnabled == b.wirelessEnabled
         && a.wirelessHardwareEnabled == b.wirelessHardwareEnabled
-        && a.primaryConnectionPath == b.primaryConnectionPath;
+        && a.primaryConnectionPath == b.primaryConnectionPath
+        && a.rawNmState == b.rawNmState
+        && a.rawConnectivity == b.rawConnectivity
+        && a.connectivityCheckAvailable == b.connectivityCheckAvailable
+        && a.connectivityCheckEnabled == b.connectivityCheckEnabled
+        && a.connectivityCheckUri == b.connectivityCheckUri;
 }
 
 bool activeEquivalent(const nm::ActiveConnectionRecord &a, const nm::ActiveConnectionRecord &b)
 {
-    return a.path == b.path
-        && a.connectionPath == b.connectionPath
-        && a.specificObjectPath == b.specificObjectPath
-        && a.id == b.id
-        && a.uuid == b.uuid
-        && a.type == b.type
-        && a.devices == b.devices
-        && a.state == b.state
-        && a.isVpn == b.isVpn
-        && a.isDefault4 == b.isDefault4
-        && a.isDefault6 == b.isDefault6
-        && a.ip4ConfigPath == b.ip4ConfigPath
-        && a.ip6ConfigPath == b.ip6ConfigPath
-        && a.ip4Addresses == b.ip4Addresses
-        && a.ip6Addresses == b.ip6Addresses
-        && a.ip4Gateway == b.ip4Gateway
-        && a.ip6Gateway == b.ip6Gateway
-        && a.ip4Dns == b.ip4Dns
-        && a.ip6Dns == b.ip6Dns
-        && a.ip4RouteCount == b.ip4RouteCount
-        && a.ip6RouteCount == b.ip6RouteCount;
+    return a == b;
 }
 
 bool connectionEquivalent(const nm::ConnectionViewRecord &a, const nm::ConnectionViewRecord &b)
 {
-    return a.connectionPath == b.connectionPath
-        && a.id == b.id
-        && a.uuid == b.uuid
-        && a.type == b.type
-        && a.active == b.active
-        && a.autoconnect == b.autoconnect
-        && a.stale == b.stale
-        && a.lastUsedTimestamp == b.lastUsedTimestamp;
+    return a == b;
 }
 
 bool deviceEquivalent(const nm::DeviceRecord &a, const nm::DeviceRecord &b)
 {
-    return a.path == b.path
-        && a.interfaceName == b.interfaceName
-        && a.ipInterfaceName == b.ipInterfaceName
-        && a.type == b.type
-        && a.state == b.state
-        && a.activeConnectionPath == b.activeConnectionPath
-        && a.activeAccessPointPath == b.activeAccessPointPath
-        && a.accessPointPaths == b.accessPointPaths
-        && a.hardwareAddress == b.hardwareAddress
-        && a.bitrateKbps == b.bitrateKbps
-        && a.rxBytes == b.rxBytes
-        && a.txBytes == b.txBytes;
+    return a == b;
 }
 
 bool wifiEquivalent(const nm::WifiViewRecord &a, const nm::WifiViewRecord &b)
 {
-    return a.apPath == b.apPath
-        && a.ssid == b.ssid
-        && a.devicePath == b.devicePath
-        && a.strength == b.strength
-        && a.secure == b.secure
-        && a.active == b.active
-        && a.savedConnectionPath == b.savedConnectionPath
-        && a.autoconnect == b.autoconnect
-        && a.autoconnectPriority == b.autoconnectPriority
-        && a.lastUsedTimestamp == b.lastUsedTimestamp
-        && a.stale == b.stale;
+    return a == b;
 }
 
 } // namespace
@@ -665,6 +683,16 @@ bool NmModel::showLowSignalNetworks() const
     return mShowLowSignalNetworks;
 }
 
+const nm::Snapshot &NmModel::cacheSnapshot() const
+{
+    return mCache.snapshot();
+}
+
+QList<nm::ActiveConnectionRecord> NmModel::activeConnections() const
+{
+    return mActive;
+}
+
 NmModel::ManagerState NmModel::managerState() const
 {
     return mManagerState;
@@ -709,10 +737,10 @@ QList<NmModel::RecentConnection> NmModel::recentConnections(int maxCount) const
 
 void NmModel::activateConnection(const QModelIndex &index)
 {
-    const ItemId id = static_cast<ItemId>(index.internalId());
     if (!isValidDataIndex(index)) {
         return;
     }
+    const ItemId id = static_cast<ItemId>(index.internalId());
 
     if (id == ITEM_CONNECTION_LEAF) {
         const auto &conn = mConnections.at(index.row());
@@ -720,45 +748,30 @@ void NmModel::activateConnection(const QModelIndex &index)
         QString specificObject = QStringLiteral("/");
 
         if (isWirelessType(conn.type)) {
-            QString ifaceHint;
             const auto sIt = mCache.snapshot().savedConnections.find(conn.connectionPath);
-            if (sIt != mCache.snapshot().savedConnections.end()) {
-                ifaceHint = sIt->interfaceName;
+            const QString ifaceHint = sIt == mCache.snapshot().savedConnections.end() ? QString{} : sIt->interfaceName;
+            const QByteArray ssidBytes = sIt == mCache.snapshot().savedConnections.end() ? QByteArray{} : sIt->wifiSsidBytes;
+            const WifiTarget target = pickWifiTarget(mCache.snapshot(), ifaceHint, ssidBytes);
+            if (target.devicePath.isEmpty()) {
+                emit actionFailed(tr("No usable Wi-Fi adapter"), tr("Enable Wi-Fi and try again."));
+                return;
             }
-            for (const auto &dev : mDevices) {
-                if (dev.type != nm::DeviceType::Wifi) {
-                    continue;
-                }
-                if (!ifaceHint.isEmpty() && dev.interfaceName != ifaceHint) {
-                    continue;
-                }
-                if (dev.state >= 20) {
-                    devicePath = dev.path;
-                    break;
-                }
-            }
+            devicePath = target.devicePath;
+            specificObject = target.apPath.isEmpty() ? QStringLiteral("/") : target.apPath;
         }
 
-        if (auto result = nm::NmActions::activateConnection(conn.connectionPath, devicePath, specificObject); !result) {
-            qCWarning(NM_TRAY).noquote() << QStringLiteral("activateConnection failed for '%1': %2").arg(conn.id, result.error());
-        }
+        nm::NmActions::activateConnection(conn.connectionPath, devicePath, specificObject, this,
+            [this, id = conn.id](bool ok, const QString &err, const QDBusMessage &) {
+                if (!ok) {
+                    qCWarning(NM_TRAY).noquote() << QStringLiteral("activateConnection failed for '%1': %2").arg(id, err);
+                    emit actionFailed(tr("Could not connect to %1").arg(id), err);
+                }
+            });
         return;
     }
 
     if (id == ITEM_WIFINET_LEAF) {
-        const auto &wifi = mWifi.at(index.row());
-        QString savedConnectionPath = wifi.savedConnectionPath;
-        if (savedConnectionPath.isEmpty()) {
-            savedConnectionPath = mCache.connectionPathForSsid(wifi.ssid);
-        }
-        if (savedConnectionPath.isEmpty()) {
-            // No saved connection, prompt to create one
-            promptAndCreateWifiConnection(wifi.ssid, wifi.devicePath, wifi.secure);
-            return;
-        }
-        if (auto result = nm::NmActions::activateConnection(savedConnectionPath, wifi.devicePath, wifi.apPath); !result) {
-            qCWarning(NM_TRAY).noquote() << QStringLiteral("activateConnection failed for SSID '%1': %2").arg(wifi.ssid, result.error());
-        }
+        connectToWifi(mWifi.at(index.row()));
     }
 }
 
@@ -767,7 +780,7 @@ void NmModel::deactivateConnection(const QModelIndex &index)
     if (!isValidDataIndex(index) || static_cast<ItemId>(index.internalId()) != ITEM_ACTIVE_LEAF) {
         return;
     }
-    disconnectActiveConnection(mActive.at(index.row()));
+    disconnectActiveConnection(mActive.at(index.row()), false);
 }
 
 void NmModel::requestScan(const QModelIndex &index) const
@@ -779,9 +792,12 @@ void NmModel::requestScan(const QModelIndex &index) const
     if (dev.type != nm::DeviceType::Wifi) {
         return;
     }
-    if (auto result = nm::NmActions::requestScan(dev.path); !result) {
-        qCWarning(NM_TRAY).noquote() << QStringLiteral("requestScan failed for '%1': %2").arg(dev.interfaceName, result.error());
-    }
+    nm::NmActions::requestScan(dev.path, const_cast<NmModel *>(this),
+        [iface = dev.interfaceName](bool ok, const QString &err, const QDBusMessage &) {
+            if (!ok) {
+                qCWarning(NM_TRAY).noquote() << QStringLiteral("requestScan failed for '%1': %2").arg(iface, err);
+            }
+        });
 }
 
 void NmModel::requestAllWifiScan() const
@@ -791,24 +807,33 @@ void NmModel::requestAllWifiScan() const
         if (dev.type != nm::DeviceType::Wifi) {
             continue;
         }
-        if (auto result = nm::NmActions::requestScan(dev.path); !result) {
-            qCWarning(NM_TRAY).noquote() << QStringLiteral("requestScan failed for '%1': %2").arg(dev.interfaceName, result.error());
-        }
+        nm::NmActions::requestScan(dev.path, const_cast<NmModel *>(this),
+            [iface = dev.interfaceName](bool ok, const QString &err, const QDBusMessage &) {
+                if (!ok) {
+                    qCWarning(NM_TRAY).noquote() << QStringLiteral("requestScan failed for '%1': %2").arg(iface, err);
+                }
+            });
     }
 }
 
 void NmModel::setNetworkingEnabled(bool enabled)
 {
-    if (auto result = nm::NmActions::setNetworkingEnabled(enabled); !result) {
-        qCWarning(NM_TRAY).noquote() << QStringLiteral("setNetworkingEnabled failed: %1").arg(result.error());
-    }
+    nm::NmActions::setNetworkingEnabled(enabled, this, [this](bool ok, const QString &err, const QDBusMessage &) {
+        if (!ok) {
+            qCWarning(NM_TRAY).noquote() << QStringLiteral("setNetworkingEnabled failed: %1").arg(err);
+            emit actionFailed(tr("Could not change networking state"), err);
+        }
+    });
 }
 
 void NmModel::setWirelessEnabled(bool enabled)
 {
-    if (auto result = nm::NmActions::setWirelessEnabled(enabled); !result) {
-        qCWarning(NM_TRAY).noquote() << QStringLiteral("setWirelessEnabled failed: %1").arg(result.error());
-    }
+    nm::NmActions::setWirelessEnabled(enabled, this, [this](bool ok, const QString &err, const QDBusMessage &) {
+        if (!ok) {
+            qCWarning(NM_TRAY).noquote() << QStringLiteral("setWirelessEnabled failed: %1").arg(err);
+            emit actionFailed(tr("Could not change Wi-Fi state"), err);
+        }
+    });
 }
 
 void NmModel::setConnectionAutoconnect(const QString &connectionPath, bool enabled)
@@ -817,12 +842,15 @@ void NmModel::setConnectionAutoconnect(const QString &connectionPath, bool enabl
         return;
     }
 
-    if (auto result = nm::NmActions::setConnectionAutoconnect(connectionPath, enabled); !result) {
-        qCWarning(NM_TRAY).noquote() << QStringLiteral("setConnectionAutoconnect failed for '%1': %2").arg(connectionPath, result.error());
-        return;
-    }
-
-    QMetaObject::invokeMethod(mDbus, "refreshNow", Qt::QueuedConnection);
+    nm::NmActions::setConnectionAutoconnect(connectionPath, enabled, this,
+        [this, connectionPath](bool ok, const QString &err, const QDBusMessage &) {
+            if (!ok) {
+                qCWarning(NM_TRAY).noquote() << QStringLiteral("setConnectionAutoconnect failed for '%1': %2").arg(connectionPath, err);
+                emit actionFailed(tr("Could not change automatic connection"), err);
+                return;
+            }
+            QMetaObject::invokeMethod(mDbus, "refreshNow", Qt::QueuedConnection);
+        });
 }
 
 void NmModel::setShowLowSignalNetworks(bool enabled)
@@ -832,6 +860,17 @@ void NmModel::setShowLowSignalNetworks(bool enabled)
     }
     mShowLowSignalNetworks = enabled;
     rebuildFromSnapshot(mCache.snapshot());
+}
+
+void NmModel::setOrderHold(bool held)
+{
+    if (mOrderHeld == held) {
+        return;
+    }
+    mOrderHeld = held;
+    if (!mOrderHeld) {
+        rebuildFromSnapshot(mCache.snapshot());
+    }
 }
 
 void NmModel::disconnectPrimaryConnection()
@@ -844,14 +883,29 @@ void NmModel::disconnectPrimaryConnection()
         return active.path == mManagerState.primaryConnectionPath;
     });
     if (activeIt == mActive.cend()) {
-        if (auto result = nm::NmActions::deactivateConnection(mManagerState.primaryConnectionPath); !result) {
-            qCWarning(NM_TRAY).noquote() << QStringLiteral("disconnectPrimaryConnection failed: %1").arg(result.error());
-        }
+        nm::NmActions::deactivateConnection(mManagerState.primaryConnectionPath, this,
+            [this](bool ok, const QString &err, const QDBusMessage &) {
+                if (!ok) {
+                    qCWarning(NM_TRAY).noquote() << QStringLiteral("disconnectPrimaryConnection failed: %1").arg(err);
+                    emit actionFailed(tr("Could not disconnect"), err);
+                }
+            });
         return;
     }
 
-    if (!disconnectActiveConnection(*activeIt)) {
-        qCWarning(NM_TRAY).noquote() << QStringLiteral("disconnectPrimaryConnection failed for '%1'").arg(activeIt->id);
+    disconnectActiveConnection(*activeIt, false);
+}
+
+void NmModel::disconnectPrimaryConnectionAndStayOff()
+{
+    if (mManagerState.primaryConnectionPath.isEmpty() || mManagerState.primaryConnectionPath == QStringLiteral("/")) {
+        return;
+    }
+    const auto activeIt = std::find_if(mActive.cbegin(), mActive.cend(), [this](const nm::ActiveConnectionRecord &active) {
+        return active.path == mManagerState.primaryConnectionPath;
+    });
+    if (activeIt != mActive.cend()) {
+        disconnectActiveConnection(*activeIt, true);
     }
 }
 
@@ -876,23 +930,36 @@ void NmModel::activateConnectionPath(const QString &connectionPath)
         if (sIt != mCache.snapshot().savedConnections.end()) {
             ifaceHint = sIt->interfaceName;
         }
-        for (const auto &dev : mDevices) {
-            if (dev.type != nm::DeviceType::Wifi) {
-                continue;
-            }
-            if (!ifaceHint.isEmpty() && dev.interfaceName != ifaceHint) {
-                continue;
-            }
-            if (dev.state >= 20) {
-                devicePath = dev.path;
-                break;
-            }
+        const QByteArray ssidBytes = sIt == mCache.snapshot().savedConnections.end() ? QByteArray{} : sIt->wifiSsidBytes;
+        const WifiTarget target = pickWifiTarget(mCache.snapshot(), ifaceHint, ssidBytes);
+        if (target.devicePath.isEmpty()) {
+            emit actionFailed(tr("No usable Wi-Fi adapter"), tr("Enable Wi-Fi and try again."));
+            return;
         }
+        devicePath = target.devicePath;
+        specificObject = target.apPath.isEmpty() ? QStringLiteral("/") : target.apPath;
     }
 
-    if (auto result = nm::NmActions::activateConnection(connIt->connectionPath, devicePath, specificObject); !result) {
-        qCWarning(NM_TRAY).noquote() << QStringLiteral("activateConnectionPath failed for '%1': %2").arg(connIt->id, result.error());
+    nm::NmActions::activateConnection(connIt->connectionPath, devicePath, specificObject, this,
+        [this, id = connIt->id](bool ok, const QString &err, const QDBusMessage &) {
+            if (!ok) {
+                qCWarning(NM_TRAY).noquote() << QStringLiteral("activateConnectionPath failed for '%1': %2").arg(id, err);
+                emit actionFailed(tr("Could not connect to %1").arg(id), err);
+            }
+        });
+}
+
+void NmModel::activateSavedOnAp(const QString &connectionPath, const QString &devicePath, const QString &apPath)
+{
+    if (connectionPath.isEmpty()) {
+        return;
     }
+    nm::NmActions::activateConnection(connectionPath, devicePath, apPath, this,
+        [this](bool ok, const QString &err, const QDBusMessage &) {
+            if (!ok) {
+                emit actionFailed(tr("Could not connect"), err);
+            }
+        });
 }
 
 void NmModel::onSnapshotChanged(const nm::Snapshot &snapshot)
@@ -946,18 +1013,22 @@ void NmModel::rebuildFromSnapshot(const nm::Snapshot &snapshot)
         nextWifi = std::move(filtered);
     }
 
-    auto applySection = [this](ItemId sectionId, auto &current, const auto &next, auto keyOf, auto isSameItem) {
-        QStringList currentKeys;
-        QStringList nextKeys;
-        currentKeys.reserve(current.size());
-        nextKeys.reserve(next.size());
-        for (const auto &item : current) {
-            currentKeys.push_back(keyOf(item));
+    if (mOrderHeld) {
+        QList<nm::WifiViewRecord> rest = std::move(nextWifi);
+        nextWifi.clear();
+        for (const auto &currentWifi : mWifi) {
+            const auto it = std::find_if(rest.begin(), rest.end(), [&currentWifi](const nm::WifiViewRecord &wifi) {
+                return wifi.apPath == currentWifi.apPath;
+            });
+            if (it != rest.end()) {
+                nextWifi.push_back(*it);
+                rest.erase(it);
+            }
         }
-        for (const auto &item : next) {
-            nextKeys.push_back(keyOf(item));
-        }
+        nextWifi.append(rest);
+    }
 
+    auto applySection = [this](ItemId sectionId, auto &current, const auto &next, auto keyOf, auto isSameItem) {
         int sectionRow = -1;
         ItemId leafId = ITEM_ROOT;
         switch (sectionId) {
@@ -986,49 +1057,49 @@ void NmModel::rebuildFromSnapshot(const nm::Snapshot &snapshot)
         }
 
         const QModelIndex parentIdx = createIndex(sectionRow, 0, sectionId);
-        if (currentKeys != nextKeys) {
-            if (!current.isEmpty()) {
-                beginRemoveRows(parentIdx, 0, current.size() - 1);
-                current.clear();
+
+        QSet<QString> nextSet;
+        nextSet.reserve(next.size());
+        for (const auto &item : next) {
+            nextSet.insert(keyOf(item));
+        }
+
+        for (int i = current.size() - 1; i >= 0; --i) {
+            if (!nextSet.contains(keyOf(current.at(i)))) {
+                beginRemoveRows(parentIdx, i, i);
+                current.removeAt(i);
                 endRemoveRows();
             }
-            if (!next.isEmpty()) {
-                beginInsertRows(parentIdx, 0, next.size() - 1);
-                current = next;
-                endInsertRows();
-            }
-            return;
         }
 
-        if (current.isEmpty()) {
-            return;
-        }
-
-        QList<QPair<int, int>> changedRanges;
-        int rangeStart = -1;
-        for (int i = 0; i < current.size(); ++i) {
-            if (!isSameItem(current.at(i), next.at(i))) {
-                if (rangeStart < 0) {
-                    rangeStart = i;
-                }
+        for (int i = 0; i < next.size(); ++i) {
+            const QString wantKey = keyOf(next.at(i));
+            if (i < current.size() && keyOf(current.at(i)) == wantKey) {
                 continue;
             }
-            if (rangeStart >= 0) {
-                changedRanges.push_back({rangeStart, i - 1});
-                rangeStart = -1;
+            int found = -1;
+            for (int k = i + 1; k < current.size(); ++k) {
+                if (keyOf(current.at(k)) == wantKey) {
+                    found = k;
+                    break;
+                }
+            }
+            if (found >= 0) {
+                beginMoveRows(parentIdx, found, found, parentIdx, i);
+                current.move(found, i);
+                endMoveRows();
+            } else {
+                beginInsertRows(parentIdx, i, i);
+                current.insert(i, next.at(i));
+                endInsertRows();
             }
         }
-        if (rangeStart >= 0) {
-            changedRanges.push_back({rangeStart, current.size() - 1});
-        }
 
-        if (changedRanges.isEmpty()) {
-            return;
-        }
-
-        current = next;
-        for (const auto &[first, last] : changedRanges) {
-            emit dataChanged(createIndex(first, 0, leafId), createIndex(last, 0, leafId));
+        for (int i = 0; i < current.size(); ++i) {
+            if (!isSameItem(current.at(i), next.at(i))) {
+                current[i] = next.at(i);
+                emit dataChanged(createIndex(i, 0, leafId), createIndex(i, 0, leafId));
+            }
         }
     };
 
@@ -1042,6 +1113,11 @@ void NmModel::rebuildFromSnapshot(const nm::Snapshot &snapshot)
     nextManagerState.wirelessEnabled = mCache.snapshot().manager.wirelessEnabled;
     nextManagerState.wirelessHardwareEnabled = mCache.snapshot().manager.wirelessHardwareEnabled;
     nextManagerState.primaryConnectionPath = mCache.snapshot().manager.primaryConnectionPath;
+    nextManagerState.rawNmState = mCache.snapshot().manager.state;
+    nextManagerState.rawConnectivity = mCache.snapshot().manager.connectivity;
+    nextManagerState.connectivityCheckAvailable = mCache.snapshot().manager.connectivityCheckAvailable;
+    nextManagerState.connectivityCheckEnabled = mCache.snapshot().manager.connectivityCheckEnabled;
+    nextManagerState.connectivityCheckUri = mCache.snapshot().manager.connectivityCheckUri;
     nextManagerState.overallState = toOverallState(mCache.snapshot().manager.state, mCache.snapshot().manager.connectivity);
     nextManagerState.primaryKind = PrimaryKind::Unknown;
     nextManagerState.primaryName.clear();
@@ -1087,29 +1163,34 @@ void NmModel::rebuildFromSnapshot(const nm::Snapshot &snapshot)
     }
 }
 
-bool NmModel::disconnectActiveConnection(const nm::ActiveConnectionRecord &active)
+void NmModel::disconnectActiveConnection(const nm::ActiveConnectionRecord &active, bool stayOff)
 {
     const bool isDeviceBacked = !active.isVpn
         && (active.type == QStringLiteral("802-11-wireless")
             || active.type == QStringLiteral("802-3-ethernet")
             || active.type == QStringLiteral("bluetooth"));
 
-    if (isDeviceBacked && !active.devices.isEmpty()) {
+    if (stayOff && isDeviceBacked && !active.devices.isEmpty()) {
         const QString devicePath = active.devices.front();
-        if (auto result = nm::NmActions::disconnectDevice(devicePath); !result) {
-            qCWarning(NM_TRAY).noquote()
-                << QStringLiteral("disconnectDevice failed for '%1' on '%2': %3").arg(active.id, devicePath, result.error());
-            return false;
-        }
-        return true;
+        nm::NmActions::disconnectDevice(devicePath, this,
+            [this, id = active.id, devicePath](bool ok, const QString &err, const QDBusMessage &) {
+                if (!ok) {
+                    qCWarning(NM_TRAY).noquote()
+                        << QStringLiteral("disconnectDevice failed for '%1' on '%2': %3").arg(id, devicePath, err);
+                    emit actionFailed(tr("Could not disconnect and stay offline"), err);
+                }
+            });
+        return;
     }
 
-    if (auto result = nm::NmActions::deactivateConnection(active.path); !result) {
-        qCWarning(NM_TRAY).noquote()
-            << QStringLiteral("deactivateConnection failed for '%1': %2").arg(active.id, result.error());
-        return false;
-    }
-    return true;
+    nm::NmActions::deactivateConnection(active.path, this,
+        [this, id = active.id](bool ok, const QString &err, const QDBusMessage &) {
+            if (!ok) {
+                qCWarning(NM_TRAY).noquote()
+                    << QStringLiteral("deactivateConnection failed for '%1': %2").arg(id, err);
+                emit actionFailed(tr("Could not disconnect %1").arg(id), err);
+            }
+        });
 }
 
 QString NmModel::buildActiveInfo(const nm::ActiveConnectionRecord &active) const
@@ -1121,18 +1202,18 @@ QString NmModel::buildActiveInfo(const nm::ActiveConnectionRecord &active) const
 
     str << QStringLiteral("<table>")
         << QStringLiteral("<tr><td colspan='2'><big><strong>") << tr("General", "Active connection information") << QStringLiteral("</strong></big></td></tr>")
-        << QStringLiteral("<tr><td><strong>") << tr("Connection", "Active connection information") << QStringLiteral("</strong>: </td><td>") << active.id << QStringLiteral("</td></tr>")
-        << QStringLiteral("<tr><td><strong>") << tr("Type", "Active connection information") << QStringLiteral("</strong>: </td><td>") << nm::connectionTypeLabel(active.type) << QStringLiteral("</td></tr>")
-        << QStringLiteral("<tr><td><strong>") << tr("UUID", "Active connection information") << QStringLiteral("</strong>: </td><td>") << active.uuid << QStringLiteral("</td></tr>");
+        << QStringLiteral("<tr><td><strong>") << tr("Connection", "Active connection information") << QStringLiteral("</strong>: </td><td>") << active.id.toHtmlEscaped() << QStringLiteral("</td></tr>")
+        << QStringLiteral("<tr><td><strong>") << tr("Type", "Active connection information") << QStringLiteral("</strong>: </td><td>") << nm::connectionTypeLabel(active.type).toHtmlEscaped() << QStringLiteral("</td></tr>")
+        << QStringLiteral("<tr><td><strong>") << tr("UUID", "Active connection information") << QStringLiteral("</strong>: </td><td>") << active.uuid.toHtmlEscaped() << QStringLiteral("</td></tr>");
 
     if (!active.devices.isEmpty()) {
         const auto devIt = mCache.snapshot().devices.find(active.devices.front());
         if (devIt != mCache.snapshot().devices.end()) {
             str << QStringLiteral("<tr><td><strong>") << tr("Interface", "Active connection information") << QStringLiteral("</strong>: </td><td>")
-                << devIt->interfaceName << QStringLiteral("</td></tr>");
+                << devIt->interfaceName.toHtmlEscaped() << QStringLiteral("</td></tr>");
             if (!devIt->hardwareAddress.isEmpty()) {
                 str << QStringLiteral("<tr><td><strong>") << tr("Hardware Address", "Active connection information") << QStringLiteral("</strong>: </td><td>")
-                    << devIt->hardwareAddress << QStringLiteral("</td></tr>");
+                    << devIt->hardwareAddress.toHtmlEscaped() << QStringLiteral("</td></tr>");
             }
             if (devIt->bitrateKbps > 0) {
                 str << QStringLiteral("<tr><td><strong>") << tr("Speed", "Active connection information") << QStringLiteral("</strong>: </td><td>")
@@ -1161,17 +1242,17 @@ QString NmModel::buildActiveInfo(const nm::ActiveConnectionRecord &active) const
         for (int i = 0; i < addresses.size(); ++i) {
             const QString suffix = i > 0 ? QStringLiteral("(%1)").arg(i + 1) : QString{};
             str << QStringLiteral("<tr><td><strong>") << tr("IP Address", "Active connection information") << suffix
-                << QStringLiteral("</strong>: </td><td>") << addresses.at(i) << QStringLiteral("</td></tr>");
+                << QStringLiteral("</strong>: </td><td>") << addresses.at(i).toHtmlEscaped() << QStringLiteral("</td></tr>");
         }
 
         if (!gateway.isEmpty()) {
             str << QStringLiteral("<tr><td><strong>") << tr("Default route", "Active connection information")
-                << QStringLiteral("</strong>: </td><td>") << gateway << QStringLiteral("</td></tr>");
+                << QStringLiteral("</strong>: </td><td>") << gateway.toHtmlEscaped() << QStringLiteral("</td></tr>");
         }
 
         for (int i = 0; i < dns.size(); ++i) {
             str << QStringLiteral("<tr><td><strong>") << tr("DNS(%1)", "Active connection information").arg(i + 1)
-                << QStringLiteral("</strong>: </td><td>") << dns.at(i) << QStringLiteral("</td></tr>");
+                << QStringLiteral("</strong>: </td><td>") << dns.at(i).toHtmlEscaped() << QStringLiteral("</td></tr>");
         }
 
         if (routeCount > 0) {
@@ -1195,18 +1276,238 @@ QString NmModel::buildActiveInfo(const nm::ActiveConnectionRecord &active) const
     return info;
 }
 
+void NmModel::connectToWifi(const nm::WifiViewRecord &wifi)
+{
+    const auto apIt = mCache.snapshot().accessPoints.find(wifi.apPath);
+    if (apIt == mCache.snapshot().accessPoints.end()) {
+        emit actionFailed(tr("Could not connect to %1").arg(wifi.ssid), tr("This access point is no longer in range."));
+        return;
+    }
+
+    const WifiTarget target = pickWifiTarget(mCache.snapshot(), {}, apIt->ssidBytes);
+    if (target.devicePath.isEmpty()) {
+        emit actionFailed(tr("No usable Wi-Fi adapter"), tr("Enable Wi-Fi and try again."));
+        return;
+    }
+
+    QString savedConnectionPath = wifi.savedConnectionPath;
+    if (savedConnectionPath.isEmpty()) {
+        savedConnectionPath = mCache.connectionPathForSsid(wifi.ssid);
+    }
+
+    if (!savedConnectionPath.isEmpty()) {
+        nm::NmActions::activateConnection(savedConnectionPath, target.devicePath, target.apPath, this,
+            [this, wifi, savedConnectionPath, target](bool ok, const QString &err, const QDBusMessage &reply) {
+                if (!ok) {
+                    qCWarning(NM_TRAY).noquote() << QStringLiteral("activateConnection failed for SSID '%1': %2").arg(wifi.ssid, err);
+                    if (err.contains(QStringLiteral("password"), Qt::CaseInsensitive)
+                        || err.contains(QStringLiteral("secret"), Qt::CaseInsensitive)) {
+                        promptForUpdatedWifiPassword(wifi, savedConnectionPath, target.devicePath, target.apPath);
+                    } else {
+                        emit actionFailed(tr("Could not connect to %1").arg(wifi.ssid), err);
+                    }
+                    return;
+                }
+                startActivationWatch(firstObjectPathFromReply(reply), wifi, savedConnectionPath, target.devicePath, target.apPath, true);
+            });
+        return;
+    }
+
+    const QString keyMgmt = nm::keyMgmtForAp(apIt->wpaFlags, apIt->rsnFlags, apIt->privacy);
+    if (keyMgmt == QLatin1String("wpa-eap")) {
+        emit actionFailed(tr("Enterprise Wi-Fi needs setup"),
+                          tr("Open the connection editor to create a profile for %1.").arg(wifi.ssid));
+        return;
+    }
+    promptAndCreateWifiConnection(wifi.ssid, target.devicePath, wifi.secure);
+}
+
+void NmModel::startActivationWatch(const QString &activeConnectionPath,
+                                   const nm::WifiViewRecord &wifi,
+                                   const QString &settingsPath,
+                                   const QString &devicePath,
+                                   const QString &apPath,
+                                   bool savedActivation)
+{
+    if (activeConnectionPath.isEmpty()) {
+        return;
+    }
+
+    auto *watcher = new nm::WifiActivationWatcher(activeConnectionPath, this);
+    connect(watcher, &nm::WifiActivationWatcher::finished, this,
+            [this, watcher, wifi, settingsPath, devicePath, apPath, savedActivation](nm::WifiActivationWatcher::Outcome outcome,
+                                                                                    const QString &message) {
+                watcher->deleteLater();
+                if (outcome == nm::WifiActivationWatcher::Outcome::Success) {
+                    return;
+                }
+                if (outcome == nm::WifiActivationWatcher::Outcome::WrongOrMissingPassword && savedActivation) {
+                    promptForUpdatedWifiPassword(wifi, settingsPath, devicePath, apPath);
+                    return;
+                }
+                if (outcome == nm::WifiActivationWatcher::Outcome::WrongOrMissingPassword && !settingsPath.isEmpty()) {
+                    promptForUpdatedWifiPassword(wifi, settingsPath, devicePath, apPath);
+                    return;
+                }
+                emit actionFailed(tr("Could not connect to %1").arg(wifi.ssid), message);
+            });
+    watcher->start();
+}
+
+void NmModel::promptForUpdatedWifiPassword(const nm::WifiViewRecord &wifi,
+                                           const QString &settingsPath,
+                                           const QString &devicePath,
+                                           const QString &apPath)
+{
+    if (settingsPath.isEmpty()) {
+        emit actionFailed(tr("A password is needed"), tr("No saved Wi-Fi profile was available to update."));
+        return;
+    }
+
+    auto *dialog = new WifiPasswordDialog(wifi.ssid, true, nullptr);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->setInfoText(tr("The saved password for “%1” no longer works. Enter it again.").arg(wifi.ssid));
+    connect(dialog, &QDialog::accepted, this, [this, dialog, wifi, settingsPath, devicePath, apPath] {
+        nm::NmActions::updateSavedPsk(settingsPath, dialog->password(), this,
+            [this, wifi, settingsPath, devicePath, apPath](bool ok, const QString &err, const QDBusMessage &) {
+                if (!ok) {
+                    emit actionFailed(tr("Could not save password"), err);
+                    return;
+                }
+                nm::NmActions::activateConnection(settingsPath, devicePath, apPath, this,
+                    [this, wifi, settingsPath, devicePath, apPath](bool ok2, const QString &err2, const QDBusMessage &reply2) {
+                        if (!ok2) {
+                            emit actionFailed(tr("Could not connect to %1").arg(wifi.ssid), err2);
+                            return;
+                        }
+                        startActivationWatch(firstObjectPathFromReply(reply2), wifi, settingsPath, devicePath, apPath, true);
+                    });
+            });
+    });
+    dialog->show();
+    dialog->raise();
+    dialog->activateWindow();
+}
+
 void NmModel::promptAndCreateWifiConnection(const QString &ssid, const QString &devicePath, bool secure)
 {
     auto *dialog = new WifiPasswordDialog(ssid, secure, nullptr);
     dialog->setAttribute(Qt::WA_DeleteOnClose);
 
     connect(dialog, &QDialog::accepted, this, [this, ssid, devicePath, secure, dialog]() {
-        const QString password = dialog->password();
-        if (auto result = nm::NmActions::addWifiConnection(ssid, password, devicePath, secure); !result) {
-            qCWarning(NM_TRAY).noquote() << QStringLiteral("Failed to create Wi-Fi connection for '%1': %2").arg(ssid, result.error());
-        } else if (mDbus != nullptr) {
-            QMetaObject::invokeMethod(mDbus, "refreshNow", Qt::QueuedConnection);
+        const auto apIt = std::find_if(mCache.snapshot().accessPoints.cbegin(),
+                                       mCache.snapshot().accessPoints.cend(),
+                                       [&ssid, &devicePath](const nm::AccessPointRecord &ap) {
+                                           return ap.ssid == ssid && ap.devicePath == devicePath;
+                                       });
+        if (apIt == mCache.snapshot().accessPoints.cend()) {
+            emit actionFailed(tr("Could not connect to %1").arg(ssid), tr("This access point is no longer in range."));
+            return;
         }
+        const QString password = dialog->password();
+        nm::NmActions::addAndActivateWifi(*apIt, devicePath, password, this,
+            [this, ssid, secure, devicePath, apPath = apIt->path](bool ok, const QString &err, const QDBusMessage &reply) {
+                if (!ok) {
+                    qCWarning(NM_TRAY).noquote() << QStringLiteral("Failed to create Wi-Fi connection for '%1': %2").arg(ssid, err);
+                    emit actionFailed(tr("Could not connect to %1").arg(ssid), err);
+                    return;
+                }
+                if (mDbus != nullptr) {
+                    QMetaObject::invokeMethod(mDbus, "refreshNow", Qt::QueuedConnection);
+                }
+                nm::WifiViewRecord wifi;
+                wifi.ssid = ssid;
+                wifi.secure = secure;
+                wifi.devicePath = devicePath;
+                wifi.apPath = apPath;
+                const QString settingsPath = firstObjectPathFromReply(reply);
+                const QString activePath = lastObjectPathFromReply(reply);
+                startActivationWatch(activePath, wifi, settingsPath, devicePath, apPath, false);
+            });
+    });
+
+    dialog->show();
+    dialog->raise();
+    dialog->activateWindow();
+}
+
+void NmModel::promptAndCreateHiddenWifiConnection()
+{
+    QString devicePath;
+    for (const auto &dev : mDevices) {
+        if (dev.type == nm::DeviceType::Wifi && dev.state >= 30) {
+            devicePath = dev.path;
+            break;
+        }
+    }
+    if (devicePath.isEmpty()) {
+        emit actionFailed(tr("No usable Wi-Fi adapter"), tr("Enable Wi-Fi and try again."));
+        return;
+    }
+
+    auto *dialog = new QDialog(nullptr);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->setWindowTitle(tr("Connect to hidden Wi-Fi network"));
+    auto *layout = new QFormLayout(dialog);
+    auto *ssidEdit = new QLineEdit(dialog);
+    auto *secureCheck = new QCheckBox(tr("WPA/WPA2/WPA3 personal security"), dialog);
+    secureCheck->setChecked(true);
+    auto *passwordEdit = new QLineEdit(dialog);
+    passwordEdit->setEchoMode(QLineEdit::Password);
+    auto *hint = new QLabel(tr("Passwords must be 8–63 characters, or exactly 64 hex digits."), dialog);
+    hint->setWordWrap(true);
+    layout->addRow(tr("Network name:"), ssidEdit);
+    layout->addRow(QString{}, secureCheck);
+    layout->addRow(tr("Password:"), passwordEdit);
+    layout->addRow(QString{}, hint);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, dialog);
+    auto *okButton = buttons->button(QDialogButtonBox::Ok);
+    okButton->setText(tr("Connect"));
+    layout->addRow(buttons);
+
+    auto validate = [ssidEdit, secureCheck, passwordEdit, okButton] {
+        const bool ssidOk = !ssidEdit->text().isEmpty();
+        const bool passOk = !secureCheck->isChecked() || nm::isWpaPskValid(passwordEdit->text());
+        okButton->setEnabled(ssidOk && passOk);
+    };
+    connect(ssidEdit, &QLineEdit::textChanged, dialog, validate);
+    connect(passwordEdit, &QLineEdit::textChanged, dialog, validate);
+    connect(secureCheck, &QCheckBox::toggled, dialog, [passwordEdit, hint, validate](bool checked) {
+        passwordEdit->setEnabled(checked);
+        hint->setVisible(checked);
+        validate();
+    });
+    validate();
+
+    connect(buttons, &QDialogButtonBox::rejected, dialog, &QDialog::reject);
+    connect(buttons, &QDialogButtonBox::accepted, dialog, &QDialog::accept);
+    connect(dialog, &QDialog::accepted, this, [this, dialog, ssidEdit, secureCheck, passwordEdit, devicePath] {
+        const QString ssid = ssidEdit->text();
+        nm::AccessPointRecord ap;
+        ap.ssid = ssid;
+        ap.ssidBytes = ssid.toUtf8();
+        ap.devicePath = devicePath;
+        ap.path = QStringLiteral("/");
+        ap.privacy = secureCheck->isChecked();
+        if (secureCheck->isChecked()) {
+            ap.rsnFlags = 0x100U; // KEY_MGMT_PSK
+        }
+        nm::NmActions::addAndActivateWifi(ap, devicePath, passwordEdit->text(), this,
+            [this, ssid, devicePath](bool ok, const QString &err, const QDBusMessage &reply) {
+                if (!ok) {
+                    emit actionFailed(tr("Could not connect to hidden network %1").arg(ssid), err);
+                    return;
+                }
+                nm::WifiViewRecord wifi;
+                wifi.ssid = ssid;
+                wifi.ssidBytes = ssid.toUtf8();
+                wifi.devicePath = devicePath;
+                wifi.secure = true;
+                const QString settingsPath = firstObjectPathFromReply(reply);
+                const QString activePath = lastObjectPathFromReply(reply);
+                startActivationWatch(activePath, wifi, settingsPath, devicePath, QStringLiteral("/"), false);
+            },
+            true);
     });
 
     dialog->show();

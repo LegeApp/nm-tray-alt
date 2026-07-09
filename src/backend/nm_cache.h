@@ -10,6 +10,7 @@ struct WifiViewRecord
 {
     QString apPath;
     QString ssid;
+    QByteArray ssidBytes;
     QString devicePath;
     int strength = 0;
     bool secure = false;
@@ -19,6 +20,8 @@ struct WifiViewRecord
     int autoconnectPriority = 0;
     qint64 lastUsedTimestamp = 0;
     bool stale = false;
+
+    bool operator==(const WifiViewRecord &) const = default;
 };
 
 struct ConnectionViewRecord
@@ -31,6 +34,8 @@ struct ConnectionViewRecord
     bool autoconnect = false;
     bool stale = false;
     qint64 lastUsedTimestamp = 0;
+
+    bool operator==(const ConnectionViewRecord &) const = default;
 };
 
 class NmCache
