@@ -3,7 +3,11 @@
 
 #include <QNetworkAccessManager>
 #include <QObject>
+#include <QPointer>
+#include <QTimer>
 #include <QUrl>
+
+class QNetworkReply;
 
 namespace nm
 {
@@ -43,11 +47,21 @@ Q_SIGNALS:
 private:
     void setStatus(InternetStatus status);
     void startProbe();
+    void startNextProbe(quint64 generation);
+    void cancelProbe();
     void askNmToRecheck();
 
     QNetworkAccessManager mNam;
     InternetStatus mStatus = InternetStatus::Unknown;
-    QUrl mProbeUrl{QStringLiteral("http://connectivity-check.ubuntu.com/")};
+    QUrl mProbeUrl{QStringLiteral("http://connectivitycheck.gstatic.com/generate_204")};
+    QList<QUrl> mProbeUrls;
+    QPointer<QNetworkReply> mActiveReply;
+    QTimer mRetryTimer;
+    quint64 mProbeGeneration = 0;
+    qsizetype mProbeIndex = 0;
+    bool mSawPortalResponse = false;
+    bool mNetworkConnected = false;
+    bool mFallbackProbeNeeded = false;
     bool mProbeRunning = false;
 };
 
